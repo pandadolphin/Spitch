@@ -2,6 +2,24 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.7.1] — 2026-07-16
+
+### 新增：说话时自动暂停媒体（MPRIS / playerctl）
+
+按住说话键（默认 `Ctrl+Alt`，以及 salmon 热键）时，通过 `playerctl`
+暂停当前处于 **Playing** 状态的 MPRIS 播放器（Spotify、浏览器标签、
+Totem 等）；松手、取消（和弦第三键）或会话异常结束时只恢复我们暂停过
+的播放器，不会误启动原本就停着的应用。
+
+原因：Spitch 为了 prebuffer 会常驻 `arecord`，音频服务器看不到
+“刚开始录音”的事件，因此系统级 cork/duck 无法对应热键。必须在 daemon
+的 press/release 路径上显式调 MPRIS。
+
+- 配置项 `audio.pause_media_on_talk`（默认 `true`）
+- 控制台「设置」页新增对应复选框
+- 依赖系统包 `playerctl`；未安装时 daemon 打一条 warning 后跳过，
+  不影响语音本身
+
 ## [0.7.0] — 2026-06-10
 
 salmon 模式新增 `tap` 事件。

@@ -30,6 +30,7 @@ from .eventbus import EventBus
 from .history import HistoryEntry, HistoryRing, default_history_path
 from .hotkey import HotkeyListener, parse_combo
 from .inject import inject_text
+from .media_pause import MediaPauser
 from .tray import try_create as try_create_indicator
 from .voice import (
     AudioCapture,
@@ -193,6 +194,16 @@ class SpitchDaemon:
         # timer expires → discard as a misfire. The 500ms prebuffer
         # captures audio across the debounce window so nothing is lost.
         self._salmon_debounce_timer: Optional[threading.Timer] = None
+        # Pause MPRIS players for the duration of a talk session so
+        # music does not talk over the mic. See media_pause.MediaPauser.
+        pause_media = True
+        try:
+            pause_media = bool(
+                (cfg.get("audio") or {}).get("pause_media_on_talk", True)
+            )
+        except (TypeError, ValueError):
+            pause_media = True
+        self._media = MediaPauser(enabled=pause_media)
 
     def _build_voice(self) -> VoiceController:
         d = self._cfg["doubao"]
@@ -297,6 +308,14 @@ class SpitchDaemon:
             })
             log.info("salmon session_end (duration=%.1fs)", duration)
             self._active_source = ""
+        # Safety net: if a session ended without a clean release/cancel
+        # path (error, watchdog race, …) make sure music is not left
+        # paused. resume() is a no-op when we already restored players.
+        if s in (State.IDLE, State.ERROR):
+            try:
+                self._media.resume()
+            except Exception:
+                log.exception("media resume on state=%s failed", s)
         if self._indicator is not None:
             # Tray icon + label provide all the state feedback the
             # user needs; suppress the desktop notification popups
@@ -370,6 +389,10 @@ class SpitchDaemon:
         self._pending_final = new_pending
         self._press_accepted = True
         self._press_started_at = time.time()
+        try:
+            self._media.pause()
+        except Exception:
+            log.exception("media pause on press failed")
         # Snapshot audio backend health so a "no partial ever arrived"
         # bug report can be attributed to the right layer (mic stream
         # vs. server) instead of guessing.
@@ -405,6 +428,13 @@ class SpitchDaemon:
             log.info("release: ignored (no accepted press)")
             return
         self._press_accepted = False
+        # Resume media as soon as the user stops talking — do not wait
+        # for FINALIZING / inject, which can take seconds on a slow
+        # network and would leave songs muted too long.
+        try:
+            self._media.resume()
+        except Exception:
+            log.exception("media resume on release failed")
         # Read the configured release-linger. Two failure modes this
         # guards against, both observed live:
         #   1. sounddevice drops the trailing partial-blocksize chunk
@@ -467,6 +497,10 @@ class SpitchDaemon:
         self._press_accepted = False
         self._pending_final = None
         self._active_source = ""
+        try:
+            self._media.resume()
+        except Exception:
+            log.exception("media resume on cancel failed")
         log.info("cancelled (third key during chord)")
 
     # -- salmon-mode hotkey callbacks ---------------------------------
@@ -517,6 +551,10 @@ class SpitchDaemon:
         self._active_source = "salmon"
         self._press_accepted = True
         self._salmon_session_started_at = time.time()
+        try:
+            self._media.pause()
+        except Exception:
+            log.exception("media pause on salmon press failed")
         log.info("salmon press: subscribers=%d", self._bus.subscriber_count())
         self._bus.publish({
             "evt": "session_start", "source": "salmon",
@@ -559,6 +597,10 @@ class SpitchDaemon:
         self._press_accepted = False
         self._cancel_salmon_watchdog()
         try:
+            self._media.resume()
+        except Exception:
+            log.exception("media resume on salmon release failed")
+        try:
             linger_ms = int(
                 (self._cfg.get("audio") or {}).get("release_linger_ms", 300)
             )
@@ -595,6 +637,10 @@ class SpitchDaemon:
         self._press_accepted = False
         self._cancel_salmon_watchdog()
         self._active_source = ""
+        try:
+            self._media.resume()
+        except Exception:
+            log.exception("media resume on salmon cancel failed")
         self._bus.publish({"evt": "session_cancel", "source": "salmon"})
 
     def _cancel_salmon_watchdog(self) -> None:
@@ -631,6 +677,10 @@ class SpitchDaemon:
         except Exception:
             log.exception("watchdog release failed")
         self._press_accepted = False
+        try:
+            self._media.resume()
+        except Exception:
+            log.exception("media resume on salmon watchdog failed")
 
     # -- finalize+inject ----------------------------------------------
 

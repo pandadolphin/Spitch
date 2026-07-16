@@ -58,6 +58,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # this since they're already waiting for the inject to land.
         # Set to 0 to disable (matches pre-0.5.5 behavior).
         "release_linger_ms": 300,
+        # When true, pause MPRIS media players (via playerctl) for the
+        # duration of a talk session so music/video does not talk over
+        # the mic. Players that were Playing at press are resumed on
+        # release / cancel. Requires the ``playerctl`` package; if it
+        # is missing the daemon logs once and continues without pause.
+        "pause_media_on_talk": True,
     },
     "hotkey": {
         "talk_key": "Ctrl+Alt",

@@ -17,6 +17,7 @@
 ## 特性
 
 - **全局热键**：默认 `Ctrl+Alt` 双键长按；按下第三键（如 `Ctrl+Alt+T`）自动取消，让系统快捷键正常生效
+- **说话时自动暂停媒体**（v0.7.1）：通过 `playerctl` 暂停 MPRIS 播放器，松手后恢复（可关）
 - **真·实时 ASR**：豆包 BigModel 实时端点，自带标点 + 数字归一（ITN），中文一次性输出
 - **绕过 IM 框架**：转写结果走"剪贴板 + 合成 `Ctrl+Shift+V`"，在 GTK / Qt / Electron / 原生 Wayland 应用里都能粘——飞书、微信、VS Code、Chrome 地址栏、Slack 全都覆盖
 - **历史 / 重粘 / 控制台**（v0.5）：daemon 保留最近 50 条转写。`spitch-console` 三 tab 窗口（历史 / 日志 / 设置），托盘菜单一键打开；`spitch-cli repaste` 可绑定到任何系统快捷键，失败/想再发一遍时一键补救
@@ -51,9 +52,9 @@ git clone https://github.com/pekinlcc/Spitch.git
 cd Spitch
 
 # Wayland 用户
-sudo apt-get install -y python3-evdev wl-clipboard
+sudo apt-get install -y python3-evdev wl-clipboard playerctl
 # X11 用户用下面这条
-# sudo apt-get install -y python3-evdev xclip
+# sudo apt-get install -y python3-evdev xclip playerctl
 
 ./scripts/install.sh
 spitch-config        # 填豆包凭据，点 "Test connection" 验证
@@ -74,6 +75,7 @@ spitch-daemon &      # 按住 Ctrl+Alt 说话，松开后自动粘贴
 | `doubao.endpoint` | WebSocket 接入点 | `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel` |
 | `audio.sample_rate` | 麦克风采样率 | 16000 |
 | `audio.prebuffer_ms` | 常驻麦克风的环形预缓冲长度（ms）。修复"按下后说的前半截被吃掉"——按下时回放这段缓冲。设为 0 = 关闭常驻麦克风，按下才开 | `500` |
+| `audio.pause_media_on_talk` | 按住说话键时用 `playerctl` 暂停正在播放的 MPRIS 媒体，松手后恢复。需安装 `playerctl` | `true` |
 | `hotkey.talk_key` | 按住说话的修饰键组合 | `Ctrl+Alt` |
 | `inject.paste_keystroke` | 粘贴用的合成快捷键 | `Ctrl+Shift+V` |
 | `inject.restore_clipboard_delay_ms` | 粘贴后等多久才把剪贴板还原（ms） | `800` |

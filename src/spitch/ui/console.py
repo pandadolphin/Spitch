@@ -410,6 +410,16 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
         e_final_wait.set_value(5)
     add_row(4, "等 final 最长秒数", e_final_wait)
 
+    cb_pause_media = Gtk.CheckButton(
+        label="说话时自动暂停正在播放的媒体 (playerctl / MPRIS)"
+    )
+    cb_pause_media.set_active(bool(a.get("pause_media_on_talk", True)))
+    cb_pause_media.set_tooltip_text(
+        "按住说话键时暂停 Spotify / 浏览器 / 播放器等；松手后恢复。"
+        "需要系统安装 playerctl 包。"
+    )
+    grid.attach(cb_pause_media, 0, 5, 3, 1)
+
     # --- Auto-start checkbox ----------------------------------------
     # Talks to the user-level systemd unit. Hidden when systemctl
     # --user isn't a thing on this host (non-systemd distros).
@@ -426,7 +436,7 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
         cb_autostart.set_tooltip_text(
             "这台机器没有可用的 systemd --user 实例，无法自动启动"
         )
-    grid.attach(cb_autostart, 0, 5, 3, 1)
+    grid.attach(cb_autostart, 0, 6, 3, 1)
 
     info = Gtk.Label(
         label=(
@@ -461,6 +471,7 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
         new_cfg["inject"]["final_wait_seconds"] = float(e_final_wait.get_value())
         new_cfg["audio"] = dict(new_cfg.get("audio") or {})
         new_cfg["audio"]["prebuffer_ms"] = int(e_prebuf.get_value())
+        new_cfg["audio"]["pause_media_on_talk"] = bool(cb_pause_media.get_active())
         try:
             path = save_config(new_cfg)
             status.set_text(f"已保存 → {path}\n手动重启 daemon 后生效：pkill -f 'python3? -m spitch' && spitch-daemon &")

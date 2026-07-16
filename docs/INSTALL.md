@@ -63,6 +63,14 @@ A small GTK dialog opens (or a CLI fallback if PyGObject is missing).
 | Audio sample rate| 16000 (recommended)                                           |
 | Push-to-talk key | Hold this combo to record. Default `Ctrl+Alt`.                |
 
+Optional but recommended for auto-pause of music while talking:
+
+```bash
+sudo apt-get install -y playerctl
+```
+
+Controlled by `audio.pause_media_on_talk` in config (default `true`).
+
 The console's "Secret Key" is **not** used by this realtime endpoint —
 leave it where it is.
 
