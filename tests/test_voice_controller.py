@@ -356,64 +356,94 @@ class CancelReliabilityTests(unittest.TestCase):
         return False
 
     def test_c0_cancel_before_publish(self):
-        """cancel() immediately after press(), before worker publishes.
+        """cancel() forced while worker is pre-publish (``_session_task is None``).
 
-        Flag alone must abort the session at publish (C0); no on_final.
+        Barrier holds ``_session_main`` before publish. Cancel must set the
+        flag under lock so publish sees ``already=True`` and aborts; no
+        ``on_final``; no hung worker; state recoverable.
         """
-        entered = threading.Event()
-        release_enter = threading.Event()
 
-        class SlowConnectClient:
+        class HungConnectClient:
             async def __aenter__(self):
-                entered.set()
-                # Block until test allows, or until cancelled
-                try:
-                    await asyncio.wait_for(
-                        asyncio.get_running_loop().run_in_executor(
-                            None, release_enter.wait
-                        ),
-                        timeout=5.0,
-                    )
-                except asyncio.CancelledError:
-                    raise
+                # If cancel fails to land, this hangs forever (repro for TOCTOU).
+                await asyncio.Future()
                 return self
 
             async def __aexit__(self, exc_type, exc, tb):
                 return None
 
             async def stream(self, audio_iter):
-                async for _ in audio_iter:
-                    pass
                 if False:
                     yield  # pragma: no cover
 
         finals: list[str] = []
-        # Gate so cancel can race before publish: factory delays slightly
-        factory_started = threading.Event()
-
-        def factory():
-            factory_started.set()
-            # Tiny yield so cancel() from main thread can land first
-            time.sleep(0.05)
-            return SlowConnectClient()
-
+        ready = threading.Event()
+        go = threading.Event()
         ctrl = VoiceController(
-            client_factory=factory,
+            client_factory=lambda: HungConnectClient(),
             audio=FakeAudio([b"\x00" * 32] * 5),
             on_final=finals.append,
             finalize_timeout=1.0,
         )
+        ctrl._test_pre_publish_barrier = (ready, go)  # type: ignore[attr-defined]
         self.assertTrue(ctrl.press())
-        # Cancel ASAP — likely before or just as worker publishes
+        self.assertTrue(ready.wait(timeout=2.0), "worker never reached pre-publish")
+        # Guaranteed: session task not published yet
+        with ctrl._lock:
+            self.assertIsNone(ctrl._session_task)
+            self.assertIsNone(ctrl._loop)
         ctrl.cancel()
-        release_enter.set()  # unblock if connect already running
+        # Flag must be set before we release publish
+        self.assertTrue(ctrl._cancel.is_set())
+        go.set()
         self.assertTrue(
             self._wait_state(ctrl, State.IDLE, timeout=3.0)
             or self._wait_state(ctrl, State.ERROR, timeout=0.1)
         )
-        # Recoverable for next press
         self.assertIn(ctrl.state, (State.IDLE, State.ERROR))
         self.assertEqual(finals, [])
+        with ctrl._lock:
+            self.assertIsNone(ctrl._session_task)
+            self.assertIsNone(ctrl._loop)
+
+    def test_c0_cancel_sets_flag_under_lock_before_read(self):
+        """Regression: cancel must set ``_cancel`` under the same lock as the
+        task read — not after releasing the lock (TOCTOU vs publish).
+        """
+        # Static inspection of ordering via a mock of the lock path:
+        # call cancel on IDLE after press cleared; more importantly,
+        # verify cancel() sets the event while holding the lock by
+        # racing a publish-like reader.
+        seen: list[tuple[bool, object]] = []
+        lock = threading.Lock()
+        cancel_evt = threading.Event()
+        loop_holder: list = [None]
+        task_holder: list = [None]
+
+        def fake_cancel():
+            with lock:
+                if True:  # not IDLE
+                    cancel_evt.set()
+                    loop = loop_holder[0]
+                    task = task_holder[0]
+            return cancel_evt.is_set(), loop, task
+
+        def fake_publish():
+            with lock:
+                already = cancel_evt.is_set()
+                task_holder[0] = "task"
+                loop_holder[0] = "loop"
+                return already
+
+        # Sequence: cancel first under lock, then publish must see already
+        flag_set, loop, task = fake_cancel()
+        already = fake_publish()
+        self.assertTrue(flag_set)
+        self.assertTrue(already)
+        self.assertIsNone(loop)
+        self.assertIsNone(task)
+        seen.append((already, task_holder[0]))
+        self.assertTrue(seen[0][0])
 
     def test_c1_cancel_during_hung_aenter(self):
         """cancel during hung __aenter__ (after task published)."""

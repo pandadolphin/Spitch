@@ -234,23 +234,37 @@ def _finite_float(value: Any, default: float) -> float:
     return x
 
 
+def _release_linger_seconds(cfg: Mapping[str, Any]) -> float:
+    """Return the release linger the daemon will actually wait (seconds).
+
+    Shared by :func:`_finalize_deadlines` and daemon release Timers so the
+    KD-12 inequality always uses the same capped, finite linger the Timer
+    schedules before ``voice.release()`` / FINALIZING.
+    """
+    audio_cfg = _section(cfg, "audio")
+    linger_ms = _finite_float(audio_cfg.get("release_linger_ms", 300), 300.0)
+    return max(0.0, min(linger_ms / 1000.0, LINGER_MAX_S))
+
+
 def _finalize_deadlines(cfg: Mapping[str, Any]) -> tuple[float, float]:
     """Return ``(controller_finalize_timeout, inject_queue_timeout)``.
 
     Inject thread starts at key-up (t=0). Controller enters FINALIZING only
-    after ``release_linger_ms``. So inject must wait longer than
+    after the release linger. So inject must wait longer than
     controller + linger or ``on_final`` can land after inject already timed
     out (transcript dropped). Both outputs are finite and positive.
+
+    Linger is resolved via :func:`_release_linger_seconds` — the same helper
+    the daemon uses for its Timer — so a huge ``release_linger_ms`` cannot
+    desync inject budget from actual FINALIZING start.
     """
     inject_cfg = _section(cfg, "inject")
-    audio_cfg = _section(cfg, "audio")
     final_wait = _finite_float(inject_cfg.get("final_wait_seconds", 30.0), 30.0)
     if final_wait < 0:
         final_wait = 30.0
     final_wait = min(final_wait, FINALIZE_MAX_S)
 
-    linger_ms = _finite_float(audio_cfg.get("release_linger_ms", 300), 300.0)
-    linger_s = max(0.0, min(linger_ms / 1000.0, LINGER_MAX_S))
+    linger_s = _release_linger_seconds(cfg)
 
     controller_t = max(final_wait, FINALIZE_MIN_S)
     inject_t = controller_t + linger_s + FINALIZE_SLACK_S

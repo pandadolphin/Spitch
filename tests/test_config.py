@@ -17,6 +17,7 @@ from spitch.config import (
     LINGER_MAX_S,
     ConfigError,
     _finalize_deadlines,
+    _release_linger_seconds,
     _section,
     clear_verified,
     config_dir,
@@ -439,6 +440,27 @@ class FinalizeDeadlineTests(unittest.TestCase):
         controller_t, inject_t = _finalize_deadlines(default_config())
         self.assertAlmostEqual(controller_t, 30.0)
         self.assertAlmostEqual(inject_t, 30.0 + 0.3 + FINALIZE_SLACK_S)
+
+    def test_huge_linger_deadlines_match_scheduled_linger_helper(self):
+        """KD-12: inject budget must cover the same capped linger the Timer uses.
+
+        With ``release_linger_ms=10000`` (above LINGER_MAX_S), both
+        ``_release_linger_seconds`` and ``_finalize_deadlines`` clamp to
+        5s so inject_t = controller_t + 5 + slack — not the raw 10s.
+        """
+        cfg = default_config()
+        cfg["audio"]["release_linger_ms"] = 10000
+        cfg["inject"]["final_wait_seconds"] = 30.0
+        scheduled = _release_linger_seconds(cfg)
+        self.assertAlmostEqual(scheduled, LINGER_MAX_S)
+        controller_t, inject_t = _finalize_deadlines(cfg)
+        self.assertAlmostEqual(controller_t, 30.0)
+        self.assertAlmostEqual(
+            inject_t, controller_t + scheduled + FINALIZE_SLACK_S
+        )
+        # Raw 10s linger would break the inequality if Timer used it:
+        raw_s = 10.0
+        self.assertLess(inject_t, controller_t + raw_s + FINALIZE_SLACK_S)
 
 
 if __name__ == "__main__":

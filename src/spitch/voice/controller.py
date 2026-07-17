@@ -180,18 +180,19 @@ class VoiceController:
     def cancel(self) -> None:
         """Abort: stop capture, signal cancellation, cancel session task.
 
-        KD-15: set flag + stop audio; under lock read loop/task; schedule
-        ``task.cancel`` via ``call_soon_threadsafe`` (C4: RuntimeError-safe).
-        If the worker has not published yet, the flag alone is enough —
-        publish protocol cancels a newly published task when ``_cancel``
-        is already set (C0).
+        KD-15: set ``_cancel`` under the same lock as reading loop/task so
+        a concurrent publish always either (a) sees ``already=True`` and
+        cancels the new task (C0), or (b) is visible here as a non-None
+        task we schedule cancel on. Then stop audio and
+        ``call_soon_threadsafe(task.cancel)`` (C4: RuntimeError-safe).
         """
         with self._lock:
             if self._state == State.IDLE:
                 return
+            # Flag first under lock — must not race publish's already check.
+            self._cancel.set()
             loop = self._loop
             task = self._session_task
-        self._cancel.set()
         self._audio.stop()
         if task is not None and loop is not None:
             try:
@@ -239,14 +240,14 @@ class VoiceController:
         """Deliver ``on_final`` at most once per session (no dual commit).
 
         Returns True if this call was the owner that committed. Cancel
-        path and empty text never commit.
+        path and empty text never commit. Cancel is re-checked under
+        the same lock that sets ``_final_committed`` so a concurrent
+        ``cancel()`` cannot land between the flag check and commit.
         """
-        if self._cancel.is_set():
-            return False
         if not text:
             return False
         with self._lock:
-            if self._final_committed:
+            if self._cancel.is_set() or self._final_committed:
                 return False
             self._final_committed = True
         try:
@@ -311,6 +312,13 @@ class VoiceController:
 
     async def _session_main(self, loop: asyncio.AbstractEventLoop) -> None:
         """Publish session task under lock ASAP, then await it (KD-15 / C0)."""
+        # Test hook: ``_test_pre_publish_barrier = (ready_evt, go_evt)``
+        # lets unit tests force cancel while ``_session_task is None``.
+        barrier = getattr(self, "_test_pre_publish_barrier", None)
+        if barrier is not None:
+            ready_evt, go_evt = barrier
+            ready_evt.set()
+            await loop.run_in_executor(None, go_evt.wait)
         session_task = loop.create_task(self._session_body())
         with self._lock:
             self._loop = loop

@@ -2,9 +2,10 @@
 
 Runs as a long-lived user process. Listens for the configured talk-key
 combo (default ``Ctrl+Alt``) via /dev/input/event*, captures audio while
-held, streams it to Doubao for realtime ASR, and on release injects the
-final punctuated text into the focused application via the clipboard +
-a synthetic Ctrl+V from /dev/uinput.
+held, streams it to the configured ASR provider (Doubao or Grok STT) for
+realtime transcription, and on release injects the final punctuated text
+into the focused application via the clipboard + a synthetic paste
+keystroke from /dev/uinput.
 
 The whole path is IM-framework-independent — it works in any
 GTK / Qt / Electron / native-Wayland application regardless of whether
@@ -28,6 +29,7 @@ from .cmdsock import CmdServer, default_socket_path
 from .config import (
     _finalize_deadlines,
     _finite_float,
+    _release_linger_seconds,
     _section,
     is_complete,
     is_verified,
@@ -460,18 +462,11 @@ class SpitchDaemon:
         # Lingering 300 ms before we tell the controller to release
         # captures a few more chunks AND lets the server's
         # recognizer finish processing the tail before EOS arrives.
-        try:
-            linger_ms = int(
-                _finite_float(
-                    _section(self._cfg, "audio").get("release_linger_ms", 300),
-                    300.0,
-                )
-            )
-        except (TypeError, ValueError):
-            linger_ms = 300
+        # Same capped linger as _finalize_deadlines (KD-12 inequality).
+        linger_s = _release_linger_seconds(self._cfg)
         log.info(
-            "release: voice.state=%s, scheduling inject (linger=%dms)",
-            self._voice.state, linger_ms,
+            "release: voice.state=%s, scheduling inject (linger=%.0fms)",
+            self._voice.state, linger_s * 1000.0,
         )
         # Capture the queue locally so a later, fast next-press that
         # replaces self._pending_final with Q2 cannot redirect *our*
@@ -482,13 +477,13 @@ class SpitchDaemon:
         # the transcript. The next accepted press is the only thing
         # that legitimately replaces it.
         pending = self._pending_final
-        if linger_ms > 0:
+        if linger_s > 0:
             # If a prior linger Timer is still pending (very fast
             # release-press-release sequence), let it fire first so
             # we don't leave the controller in a weird mid-state.
             self._cancel_pending_linger()
             self._linger_timer = threading.Timer(
-                linger_ms / 1000.0, self._voice.release,
+                linger_s, self._voice.release,
             )
             self._linger_timer.daemon = True
             self._linger_timer.start()
@@ -616,19 +611,11 @@ class SpitchDaemon:
             self._media.resume()
         except Exception:
             log.exception("media resume on salmon release failed")
-        try:
-            linger_ms = int(
-                _finite_float(
-                    _section(self._cfg, "audio").get("release_linger_ms", 300),
-                    300.0,
-                )
-            )
-        except (TypeError, ValueError):
-            linger_ms = 300
-        if linger_ms > 0:
+        linger_s = _release_linger_seconds(self._cfg)
+        if linger_s > 0:
             self._cancel_pending_linger()
             self._linger_timer = threading.Timer(
-                linger_ms / 1000.0, self._voice.release,
+                linger_s, self._voice.release,
             )
             self._linger_timer.daemon = True
             self._linger_timer.start()
