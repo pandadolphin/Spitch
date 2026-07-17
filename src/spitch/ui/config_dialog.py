@@ -3,10 +3,10 @@
 Two layers of operation:
 
 1. **GTK UI** (default) — when PyGObject + GTK 3 are available, we
-   pop a small dialog with the four required Doubao fields, audio
-   sample rate, and the two hotkeys. A "Test connection" button runs
-   :func:`spitch.ui.probe.probe_credentials` and surfaces success or
-   the error from Doubao.
+   pop a small dialog with provider selection, the required credential
+   fields for Doubao or Grok, audio sample rate, and the talk hotkey.
+   A "Test connection" button runs :func:`spitch.ui.probe.probe_credentials_for_config`
+   and surfaces success or the error from the selected provider.
 
 2. **Headless CLI** (``--cli``, or automatic when GTK is missing) —
    reads the same fields from stdin and runs the same probe. This
@@ -14,6 +14,10 @@ Two layers of operation:
 
 Either way, on success we ``mark_verified`` the saved config so the
 engine's ``do_focus_in`` knows it's allowed to enable voice.
+
+Do **not** force ``provider = "doubao"`` on save — the user's selection
+is preserved. Grok UI shows a Mandarin unvalidated warning (product
+language gate); non-``wss://`` Grok endpoints are rejected by the probe.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import argparse
 import getpass
 import sys
 from typing import Any
+from urllib.parse import urlparse
 
 from ..config import (
     clear_verified,
@@ -33,8 +38,15 @@ from ..config import (
     mark_verified,
     save_config,
 )
-from ..voice.doubao import DoubaoCredentials
-from .probe import probe_credentials
+from .probe import probe_credentials_for_config
+
+# Product language gate — shown whenever provider=grok is selected.
+_GROK_TITLE = "Grok STT (language support: validate before relying on 中文)"
+_GROK_MANDARIN_WARN = (
+    "Warning: Mandarin (中文) support is unvalidated — do not rely on Grok "
+    "for Chinese dictation until release notes confirm it."
+)
+_PROVIDERS = ("doubao", "grok")
 
 
 def _prompt(label: str, default: str = "", *, secret: bool = False) -> str:
@@ -54,27 +66,83 @@ def _prompt(label: str, default: str = "", *, secret: bool = False) -> str:
     return val.strip() or default
 
 
+def _grok_endpoint_scheme_ok(endpoint: str) -> bool:
+    """True if endpoint uses wss:// (or empty — defaults apply later)."""
+    ep = (endpoint or "").strip()
+    if not ep:
+        return True
+    scheme = (urlparse(ep).scheme or "").lower()
+    return scheme == "wss"
+
+
 def run_cli(probe: bool = True) -> int:
     cfg = load_config()
     prior_signature = credentials_signature(cfg)
-    d = dict(cfg.get("doubao") or {})
+    current_provider = cfg.get("provider") or "doubao"
+    if current_provider not in _PROVIDERS:
+        current_provider = "doubao"
+
     sys.stderr.write(
-        "Spitch — configure Doubao realtime ASR\n"
+        "Spitch — configure realtime ASR\n"
         "Press <Enter> to keep the value in [brackets].\n\n"
     )
-    d["app_key"] = _prompt("X-Api-App-Key", d.get("app_key", ""))
-    d["access_key"] = _prompt(
-        "X-Api-Access-Key", d.get("access_key", ""), secret=True
-    )
-    d["resource_id"] = _prompt(
-        "Resource ID", d.get("resource_id", "volc.bigasr.sauc.duration")
-    )
-    d["endpoint"] = _prompt(
-        "WS endpoint",
-        d.get("endpoint", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"),
-    )
-    cfg["doubao"] = d
-    cfg["provider"] = "doubao"
+    provider = _prompt("Provider (doubao/grok)", current_provider).lower()
+    if provider not in _PROVIDERS:
+        sys.stderr.write(
+            f"Unknown provider {provider!r} — choose 'doubao' or 'grok'.\n"
+        )
+        return 1
+    cfg["provider"] = provider
+
+    if provider == "grok":
+        sys.stderr.write(f"\n{_GROK_TITLE}\n{_GROK_MANDARIN_WARN}\n\n")
+        g = dict(cfg.get("grok") or {}) if isinstance(cfg.get("grok"), dict) else {}
+        defaults = default_config()["grok"]
+        g["api_key"] = _prompt(
+            "Grok API key (Bearer)",
+            g.get("api_key", ""),
+            secret=True,
+        )
+        g["endpoint"] = _prompt(
+            "WS endpoint (wss:// only)",
+            g.get("endpoint", defaults.get("endpoint", "wss://api.x.ai/v1/stt")),
+        )
+        g["language"] = _prompt(
+            "Language (optional, empty = omit)",
+            g.get("language", "") or "",
+        )
+        # Keep other grok options at prior/default values.
+        for key, default_val in defaults.items():
+            g.setdefault(key, default_val)
+        cfg["grok"] = g
+
+        if not _grok_endpoint_scheme_ok(g.get("endpoint", "")):
+            sys.stderr.write(
+                "\nGrok endpoint must use wss:// — Bearer tokens must not "
+                "ride cleartext remote endpoints.\n"
+                "Saving config without verification — voice mode will stay "
+                "disabled until a probe succeeds with a wss:// endpoint.\n"
+            )
+            cfg = clear_verified(cfg)
+            save_config(cfg)
+            return 2
+    else:
+        d = dict(cfg.get("doubao") or {}) if isinstance(cfg.get("doubao"), dict) else {}
+        d["app_key"] = _prompt("X-Api-App-Key", d.get("app_key", ""))
+        d["access_key"] = _prompt(
+            "X-Api-Access-Key", d.get("access_key", ""), secret=True
+        )
+        d["resource_id"] = _prompt(
+            "Resource ID", d.get("resource_id", "volc.bigasr.sauc.duration")
+        )
+        d["endpoint"] = _prompt(
+            "WS endpoint",
+            d.get(
+                "endpoint",
+                "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
+            ),
+        )
+        cfg["doubao"] = d
 
     if credentials_signature(cfg) != prior_signature:
         cfg = clear_verified(cfg)
@@ -84,15 +152,9 @@ def run_cli(probe: bool = True) -> int:
         return 1
 
     if probe:
-        sys.stderr.write("\nProbing Doubao endpoint…\n")
-        ok, msg = probe_credentials(
-            DoubaoCredentials(
-                app_key=d["app_key"],
-                access_key=d["access_key"],
-                resource_id=d["resource_id"],
-                endpoint=d["endpoint"],
-            )
-        )
+        label = "Grok STT" if provider == "grok" else "Doubao"
+        sys.stderr.write(f"\nProbing {label} endpoint…\n")
+        ok, msg = probe_credentials_for_config(cfg)
         sys.stderr.write(f"  → {msg}\n")
         if not ok:
             cfg = clear_verified(cfg)
@@ -121,61 +183,164 @@ def run_gtk() -> int:  # pragma: no cover - GUI is exercised manually
     from gi.repository import Gtk, GLib  # type: ignore
 
     cfg = load_config()
-    d = dict(cfg.get("doubao") or {})
-    h = dict(cfg.get("hotkey") or {})
-    a = dict(cfg.get("audio") or {})
+    d = dict(cfg.get("doubao") or {}) if isinstance(cfg.get("doubao"), dict) else {}
+    g = dict(cfg.get("grok") or {}) if isinstance(cfg.get("grok"), dict) else {}
+    h = dict(cfg.get("hotkey") or {}) if isinstance(cfg.get("hotkey"), dict) else {}
+    a = dict(cfg.get("audio") or {}) if isinstance(cfg.get("audio"), dict) else {}
+    grok_defaults = default_config()["grok"]
 
-    win = Gtk.Window(title="Spitch — Configure Doubao")
-    win.set_default_size(540, 380)
+    initial_provider = cfg.get("provider") or "doubao"
+    if initial_provider not in _PROVIDERS:
+        initial_provider = "doubao"
+
+    win = Gtk.Window(title="Spitch — Configure")
+    win.set_default_size(560, 480)
     win.set_border_width(16)
 
-    grid = Gtk.Grid(column_spacing=8, row_spacing=10)
-    win.add(grid)
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    win.add(outer)
 
-    def add_row(row: int, label_text: str, entry_text: str = "", *, is_password: bool = False):
+    # Provider row
+    provider_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    provider_row.pack_start(Gtk.Label(label="Provider", xalign=0.0), False, False, 0)
+    provider_combo = Gtk.ComboBoxText()
+    for p in _PROVIDERS:
+        provider_combo.append_text(p)
+    provider_combo.set_active(0 if initial_provider == "doubao" else 1)
+    provider_combo.set_hexpand(True)
+    provider_row.pack_start(provider_combo, True, True, 0)
+    outer.pack_start(provider_row, False, False, 0)
+
+    # Grok Mandarin warning
+    grok_warn = Gtk.Label(label="", xalign=0.0)
+    grok_warn.set_line_wrap(True)
+    grok_warn.set_markup(
+        f"<span foreground='#a67c00'>{GLib.markup_escape_text(_GROK_TITLE)}</span>\n"
+        f"<span foreground='#a67c00' size='small'>"
+        f"{GLib.markup_escape_text(_GROK_MANDARIN_WARN)}</span>"
+    )
+    outer.pack_start(grok_warn, False, False, 0)
+
+    def make_labeled_entry(
+        parent: Any,
+        label_text: str,
+        entry_text: str = "",
+        *,
+        is_password: bool = False,
+    ):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         label = Gtk.Label(label=label_text, xalign=0.0)
+        label.set_size_request(160, -1)
         entry = Gtk.Entry()
         entry.set_text(entry_text)
         if is_password:
             entry.set_visibility(False)
         entry.set_hexpand(True)
-        grid.attach(label, 0, row, 1, 1)
-        grid.attach(entry, 1, row, 2, 1)
+        row.pack_start(label, False, False, 0)
+        row.pack_start(entry, True, True, 0)
+        parent.pack_start(row, False, False, 0)
         return entry
 
-    e_app = add_row(0, "X-Api-App-Key", d.get("app_key", ""))
-    e_access = add_row(1, "X-Api-Access-Key", d.get("access_key", ""), is_password=True)
-    e_resource = add_row(2, "Resource ID", d.get("resource_id", "volc.bigasr.sauc.duration"))
-    e_endpoint = add_row(3, "WS endpoint", d.get(
-        "endpoint", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
-    ))
-    e_rate = add_row(4, "Audio sample rate", str(a.get("sample_rate", 16000)))
-    e_talk = add_row(5, "Push-to-talk key", h.get("talk_key", "Ctrl+Alt"))
+    # Doubao field group
+    doubao_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    e_app = make_labeled_entry(doubao_box, "X-Api-App-Key", d.get("app_key", ""))
+    e_access = make_labeled_entry(
+        doubao_box, "X-Api-Access-Key", d.get("access_key", ""), is_password=True
+    )
+    e_resource = make_labeled_entry(
+        doubao_box,
+        "Resource ID",
+        d.get("resource_id", "volc.bigasr.sauc.duration"),
+    )
+    e_d_endpoint = make_labeled_entry(
+        doubao_box,
+        "WS endpoint",
+        d.get(
+            "endpoint",
+            "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
+        ),
+    )
+    outer.pack_start(doubao_box, False, False, 0)
+
+    # Grok field group
+    grok_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    e_api_key = make_labeled_entry(
+        grok_box, "Grok API key", g.get("api_key", ""), is_password=True
+    )
+    e_g_endpoint = make_labeled_entry(
+        grok_box,
+        "WS endpoint (wss://)",
+        g.get("endpoint", grok_defaults.get("endpoint", "wss://api.x.ai/v1/stt")),
+    )
+    e_language = make_labeled_entry(
+        grok_box, "Language (optional)", g.get("language", "") or ""
+    )
+    outer.pack_start(grok_box, False, False, 0)
+
+    # Shared fields
+    shared_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    e_rate = make_labeled_entry(
+        shared_box, "Audio sample rate", str(a.get("sample_rate", 16000))
+    )
+    e_talk = make_labeled_entry(
+        shared_box, "Push-to-talk key", h.get("talk_key", "Ctrl+Alt")
+    )
+    outer.pack_start(shared_box, False, False, 0)
 
     status = Gtk.Label(label="", xalign=0.0)
     status.set_line_wrap(True)
-    grid.attach(status, 0, 6, 3, 1)
+    outer.pack_start(status, False, False, 0)
 
+    btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     btn_test = Gtk.Button(label="Test connection")
     btn_save = Gtk.Button(label="Save")
     btn_close = Gtk.Button(label="Close")
-    grid.attach(btn_test, 0, 7, 1, 1)
-    grid.attach(btn_save, 1, 7, 1, 1)
-    grid.attach(btn_close, 2, 7, 1, 1)
+    btn_row.pack_start(btn_test, True, True, 0)
+    btn_row.pack_start(btn_save, True, True, 0)
+    btn_row.pack_start(btn_close, True, True, 0)
+    outer.pack_start(btn_row, False, False, 0)
+
+    def selected_provider() -> str:
+        text = provider_combo.get_active_text() or "doubao"
+        return text if text in _PROVIDERS else "doubao"
+
+    def apply_provider_visibility(_combo=None) -> None:
+        is_grok = selected_provider() == "grok"
+        doubao_box.set_visible(not is_grok)
+        grok_box.set_visible(is_grok)
+        grok_warn.set_visible(is_grok)
+        win.set_title(
+            "Spitch — Configure Grok STT" if is_grok else "Spitch — Configure Doubao"
+        )
 
     def collect() -> dict[str, Any]:
         new_cfg = default_config()
         new_cfg.update(cfg)
-        new_cfg["provider"] = "doubao"
-        new_cfg["doubao"] = {
-            "app_key": e_app.get_text().strip(),
-            "access_key": e_access.get_text().strip(),
-            "resource_id": e_resource.get_text().strip(),
-            "endpoint": e_endpoint.get_text().strip(),
-        }
+        provider = selected_provider()
+        new_cfg["provider"] = provider
+        # Preserve both credential sections; update the active one.
+        new_cfg["doubao"] = dict(new_cfg.get("doubao") or {})
+        new_cfg["grok"] = dict(new_cfg.get("grok") or {})
+        if provider == "doubao":
+            new_cfg["doubao"] = {
+                "app_key": e_app.get_text().strip(),
+                "access_key": e_access.get_text().strip(),
+                "resource_id": e_resource.get_text().strip(),
+                "endpoint": e_d_endpoint.get_text().strip(),
+            }
+        else:
+            new_cfg["grok"] = {
+                **dict(grok_defaults),
+                **dict(new_cfg.get("grok") or {}),
+                "api_key": e_api_key.get_text().strip(),
+                "endpoint": e_g_endpoint.get_text().strip(),
+                "language": e_language.get_text().strip(),
+            }
         try:
             new_cfg["audio"] = dict(new_cfg.get("audio") or {})
-            new_cfg["audio"]["sample_rate"] = int(e_rate.get_text().strip() or "16000")
+            new_cfg["audio"]["sample_rate"] = int(
+                e_rate.get_text().strip() or "16000"
+            )
         except ValueError:
             new_cfg["audio"]["sample_rate"] = 16000
         new_cfg["hotkey"] = dict(new_cfg.get("hotkey") or {})
@@ -188,10 +353,14 @@ def run_gtk() -> int:  # pragma: no cover - GUI is exercised manually
         ctx.remove_class("error")
         if ok is True:
             ctx.add_class("success")
-            status.set_markup(f"<span foreground='#3b8632'>{GLib.markup_escape_text(msg)}</span>")
+            status.set_markup(
+                f"<span foreground='#3b8632'>{GLib.markup_escape_text(msg)}</span>"
+            )
         elif ok is False:
             ctx.add_class("error")
-            status.set_markup(f"<span foreground='#b00020'>{GLib.markup_escape_text(msg)}</span>")
+            status.set_markup(
+                f"<span foreground='#b00020'>{GLib.markup_escape_text(msg)}</span>"
+            )
         else:
             status.set_text(msg)
 
@@ -204,25 +373,38 @@ def run_gtk() -> int:  # pragma: no cover - GUI is exercised manually
     def on_test(_btn):
         new_cfg = collect()
         if not is_complete(new_cfg):
-            set_status("Fill in app_key + access_key + endpoint first.", ok=False)
+            if selected_provider() == "grok":
+                set_status(
+                    "Fill in api_key + endpoint (wss://) first.", ok=False
+                )
+            else:
+                set_status(
+                    "Fill in app_key + access_key + endpoint first.", ok=False
+                )
             return
-        set_status("Probing Doubao…")
+        if selected_provider() == "grok":
+            ep = (new_cfg.get("grok") or {}).get("endpoint", "")
+            if not _grok_endpoint_scheme_ok(ep):
+                set_status(
+                    "Grok endpoint must use wss:// — cleartext ws:// remote "
+                    "endpoints are rejected.",
+                    ok=False,
+                )
+                last_probe_ok["ok"] = False
+                last_probe_ok["sig"] = None
+                return
+        label = "Grok STT" if selected_provider() == "grok" else "Doubao"
+        set_status(f"Probing {label}…")
         win.set_sensitive(False)
         sig = credentials_signature(new_cfg)
 
         def worker():
             try:
-                d2 = new_cfg["doubao"]
-                ok, msg = probe_credentials(DoubaoCredentials(
-                    app_key=d2["app_key"],
-                    access_key=d2["access_key"],
-                    resource_id=d2["resource_id"],
-                    endpoint=d2["endpoint"],
-                ))
+                ok, msg = probe_credentials_for_config(new_cfg)
             except Exception as exc:
-                # If probe_credentials itself blows up (e.g., asyncio
-                # internals), don't let the thread die silently — the UI
-                # was set insensitive by on_test and we'd leave it stuck.
+                # If probe itself blows up (e.g., asyncio internals),
+                # don't let the thread die silently — the UI was set
+                # insensitive by on_test and we'd leave it stuck.
                 ok, msg = False, f"Probe crashed: {exc!r}"
 
             def done():
@@ -235,18 +417,35 @@ def run_gtk() -> int:  # pragma: no cover - GUI is exercised manually
             GLib.idle_add(done)
 
         import threading
+
         threading.Thread(target=worker, daemon=True).start()
 
     def on_save(_btn):
         new_cfg = collect()
         if not is_complete(new_cfg):
-            set_status("Cannot save: app_key, access_key, and endpoint are required.", ok=False)
+            if selected_provider() == "grok":
+                set_status(
+                    "Cannot save: api_key and endpoint are required.", ok=False
+                )
+            else:
+                set_status(
+                    "Cannot save: app_key, access_key, and endpoint are required.",
+                    ok=False,
+                )
             return
+        if selected_provider() == "grok":
+            ep = (new_cfg.get("grok") or {}).get("endpoint", "")
+            if not _grok_endpoint_scheme_ok(ep):
+                new_cfg = clear_verified(new_cfg)
+                path = save_config(new_cfg)
+                set_status(
+                    f"Saved → {path}\nGrok endpoint must use wss:// — "
+                    "voice mode stays disabled (endpoint rejected).",
+                    ok=False,
+                )
+                return
         sig = credentials_signature(new_cfg)
-        verified_now = (
-            last_probe_ok["ok"]
-            and last_probe_ok["sig"] == sig
-        )
+        verified_now = last_probe_ok["ok"] and last_probe_ok["sig"] == sig
         if verified_now:
             new_cfg = mark_verified(new_cfg)
         else:
@@ -267,21 +466,31 @@ def run_gtk() -> int:  # pragma: no cover - GUI is exercised manually
     def on_close(_btn):
         Gtk.main_quit()
 
+    provider_combo.connect("changed", apply_provider_visibility)
     btn_test.connect("clicked", on_test)
     btn_save.connect("clicked", on_save)
     btn_close.connect("clicked", on_close)
     win.connect("destroy", lambda _w: Gtk.main_quit())
 
     win.show_all()
+    apply_provider_visibility()
     Gtk.main()
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="spitch-config", description="Configure Spitch")
-    parser.add_argument("--cli", action="store_true", help="force CLI mode (no GTK)")
-    parser.add_argument("--no-probe", action="store_true", help="skip Doubao probe")
-    parser.add_argument("--print-path", action="store_true", help="print config path and exit")
+    parser = argparse.ArgumentParser(
+        prog="spitch-config", description="Configure Spitch"
+    )
+    parser.add_argument(
+        "--cli", action="store_true", help="force CLI mode (no GTK)"
+    )
+    parser.add_argument(
+        "--no-probe", action="store_true", help="skip auth probe"
+    )
+    parser.add_argument(
+        "--print-path", action="store_true", help="print config path and exit"
+    )
     args = parser.parse_args(argv)
     if args.print_path:
         print(config_path())
