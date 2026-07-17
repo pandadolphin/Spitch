@@ -1,9 +1,16 @@
 # Installing Spitch on Ubuntu 24.04
 
-Spitch v0.2 ships as a Python source tree with a user-level install
+Spitch ships as a Python source tree with a user-level install
 script. There is no compilation step — everything runs from Python and
 the system tools `wl-copy` (clipboard) and `/dev/uinput` (key
 injection) that ship with stock Ubuntu plus one apt package.
+
+**Product note:** Spitch is a **Chinese voice-input** tool. **Doubao is
+the default and recommended Chinese path** (`provider: "doubao"`). An
+optional **Grok Streaming STT** backend (`provider: "grok"`) is
+available; **Mandarin (中文) support for Grok is unvalidated**. Do not
+rely on Grok for Chinese until a live checklist passes and release notes
+say otherwise. See [Language gate](#language-gate-grok--mandarin).
 
 ## 1. System packages
 
@@ -20,6 +27,7 @@ Optional but recommended:
 
 ```bash
 sudo apt-get install -y libnotify-bin   # adds desktop notifications
+sudo apt-get install -y playerctl      # pause MPRIS media while talking
 ```
 
 PyGObject (for the GTK config dialog) is supplied by the system
@@ -46,13 +54,16 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 exec bash
 ```
 
-## 3. Configure Doubao credentials
+## 3. Configure credentials (multi-provider)
 
 ```bash
 spitch-config
 ```
 
 A small GTK dialog opens (or a CLI fallback if PyGObject is missing).
+Choose **Provider**: `doubao` (default) or `grok`.
+
+### 3a. Doubao (default — recommended for Chinese)
 
 | Field            | What it is                                                    |
 |------------------|---------------------------------------------------------------|
@@ -63,21 +74,94 @@ A small GTK dialog opens (or a CLI fallback if PyGObject is missing).
 | Audio sample rate| 16000 (recommended)                                           |
 | Push-to-talk key | Hold this combo to record. Default `Ctrl+Alt`.                |
 
-Optional but recommended for auto-pause of music while talking:
-
-```bash
-sudo apt-get install -y playerctl
-```
-
-Controlled by `audio.pause_media_on_talk` in config (default `true`).
-
 The console's "Secret Key" is **not** used by this realtime endpoint —
 leave it where it is.
 
-Click **Test connection**. The dialog opens a real WebSocket to Doubao
-using your credentials and verifies that the server accepts the
-handshake. Only on success is the config saved (chmod 600) at
-`~/.config/spitch/config.json`.
+### 3b. Grok Streaming STT (optional)
+
+1. Create an API key in the [xAI console](https://console.x.ai/).
+2. In `spitch-config`, set Provider to **`grok`**.
+3. Fill:
+
+| Field     | What it is                                              |
+|-----------|---------------------------------------------------------|
+| API key   | xAI Bearer token (`xai-…`)                              |
+| Endpoint  | Default `wss://api.x.ai/v1/stt` (**must** be `wss://`)  |
+| Language  | Optional; leave empty unless you know a supported code  |
+
+UI labels warn that **language support for Mandarin is unvalidated**.
+
+### 3c. Probe (required for either provider)
+
+Click **Test connection** (or accept the CLI probe). The dialog opens a
+real WebSocket to the selected provider and verifies the handshake:
+
+* **Doubao** — server accepts credentials / session setup.
+* **Grok** — probe requires a successful session including
+  **`transcript.done`** (silence audio is fine). Non-`wss://` endpoints
+  are rejected.
+
+Only on success is the config saved (chmod 600) at
+`~/.config/spitch/config.json`, with `verified_at` +
+`verified_signature` stamped. Changing keys or switching providers
+invalidates verification until you probe again.
+
+Controlled by `audio.pause_media_on_talk` in config (default `true`)
+when `playerctl` is installed.
+
+### Secret handling
+
+* Store keys **only** in `~/.config/spitch/config.json` (mode 600,
+  atomic write). Never commit API keys, paste them into issues, or log
+  them.
+* Repo `.gitignore` includes `grok-voice-api.key` and `*.key`. Local
+  key files are for manual seeding only — do not `git add` them.
+* Example **manual** seed (never automate in production; never commit):
+
+  ```bash
+  # Requires grok-voice-api.key already gitignored
+  # jq --arg k "$(cat grok-voice-api.key)" \
+  #   '.provider="grok" | .grok.api_key=$k' \
+  #   ~/.config/spitch/config.json > /tmp/spitch-cfg.json
+  # # then probe via spitch-config before relying on the daemon
+  ```
+
+* Unit tests use fake keys only (`xai-test-…`); they must not open a
+  workspace key path.
+
+### Rollback to Doubao
+
+Set `"provider": "doubao"` (via `spitch-config` or hand-edit) with valid
+Doubao credentials, run **Test connection**, and restart the daemon:
+
+```bash
+# after spitch-config saves provider=doubao + probe OK
+systemctl --user restart spitch.service   # if using systemd
+# or: kill the daemon and run spitch-daemon again
+```
+
+An older binary that does not understand Grok will treat
+`provider=grok` as incomplete until you switch back or upgrade.
+
+### Language gate (Grok / Mandarin)
+
+| Claim | Status |
+|-------|--------|
+| Grok usable as opt-in backend | Available when probed |
+| Grok supports 中文 / Mandarin | **Unvalidated** — language gate **closed** |
+| Recommended Chinese path | **Doubao** (default) |
+
+No in-repo live EN/ZH checklist pass has been recorded. Do not market
+Grok as a Chinese provider until that checklist passes and release notes
+say so.
+
+### Finalize wait (after release)
+
+`inject.final_wait_seconds` (default **30.0**) is the **stream budget**
+after the session enters FINALIZING (after release linger). The
+controller wait is `max(final_wait_seconds, 5.0)`; the inject queue wait
+is slightly longer by linger + slack so a late `on_final` is not dropped.
+This applies to both providers.
 
 ## 4. Grant `/dev/input` read access
 
@@ -113,8 +197,8 @@ You should see a "Spitch ready" desktop notification. Test it:
   focused field.
 
 If you press a third key during the chord (e.g. Ctrl+Alt+T to launch
-a terminal), the recording is automatically cancelled and the
-shortcut passes through normally.
+  a terminal), the recording is automatically cancelled and the
+  shortcut passes through normally.
 
 ## 6. (Optional) auto-start at login
 
@@ -162,6 +246,13 @@ journalctl --user -u spitch.service -f    # tail logs
   settle delay. If your focused app is slow to consume the paste,
   the saved clipboard may overwrite Spitch's text. Increase
   `time.sleep(0.3)` in `src/spitch/inject/text_injector.py`.
+* **Grok probe fails / non-wss endpoint** → endpoint must start with
+  `wss://`. Check key validity in the xAI console; failure messages
+  should not echo the full API key.
+* **Switched provider but daemon refuses config** → re-run
+  `spitch-config` and complete **Test connection** so
+  `verified_signature` matches the active provider credentials.
+  Legacy unsigned `verified_at` stamps authorize **Doubao only**.
 
 ## Uninstall
 
@@ -170,4 +261,4 @@ journalctl --user -u spitch.service -f    # tail logs
 ```
 
 Removes the launcher scripts and any systemd unit. Does **not** remove
-`~/.config/spitch/` (your saved Doubao credentials).
+`~/.config/spitch/` (your saved credentials).

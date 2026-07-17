@@ -4,15 +4,29 @@
 
 ## Unreleased
 
-### Multi-provider Grok config + daemon wiring
+### Multi-provider Grok Streaming STT
 
-- `provider: "grok"` is now a complete, runnable config path: `is_complete`
-  accepts Grok when `api_key` + `endpoint` are set; daemon builds
-  `GrokSttClient` via `voice.factory.make_streaming_client` / factory.
-- Network warmup branches by provider: Doubao stays connect-only; Grok
-  calls `client.warmup()` (connect + wait `transcript.created` + close).
-- User-facing incomplete-config messages are provider-neutral
+- **Multi-provider:** `provider: "doubao" | "grok"`. Doubao remains the
+  **default** and the **recommended Chinese path**. Grok is an optional
+  xAI Streaming STT backend (`wss://api.x.ai/v1/stt`).
+- **Language gate:** Mandarin (中文) support for Grok is **unvalidated**
+  (no in-repo live EN/ZH checklist pass recorded). Docs and UI do **not**
+  claim Grok supports Chinese until that gate opens.
+- **Config + daemon:** `is_complete` accepts Grok when `api_key` +
+  `endpoint` are set; daemon builds `GrokSttClient` via
+  `voice.factory.make_streaming_client`. Network warmup branches by
+  provider (Doubao connect-only; Grok `warmup()` through
+  `transcript.created`). Incomplete-config messages are provider-neutral
   (“configure Spitch first — run spitch-config”).
+- **Config UI / probe:** `spitch-config` (CLI + GTK) selects provider,
+  edits Doubao or Grok fields, and requires a successful probe before
+  stamping `verified_*`. Grok probe requires `transcript.done`; non-
+  `wss://` endpoints are rejected. Grok UI labels warn that Mandarin is
+  unvalidated.
+- **Secrets:** API keys only in `~/.config/spitch/config.json` (chmod
+  600). `.gitignore` covers `grok-voice-api.key` and `*.key` — never
+  commit keys.
+- **Rollback:** set `"provider": "doubao"`, probe, restart daemon.
 
 ### Finalize wait wiring (Doubao behavior change — intentional)
 
@@ -25,6 +39,9 @@
   inequality). Stock defaults: controller 30.0s, inject 31.3s.
 - Non-finite `final_wait_seconds` / `release_linger_ms` (`nan`/`inf`) fall
   back to safe clamps.
+- **Docs:** README no longer says “最长 5 秒”; it documents
+  `inject.final_wait_seconds` as the post-FINALIZING stream budget
+  (default **30s**).
 
 ### Cancel reliability (all providers)
 
