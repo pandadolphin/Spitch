@@ -1,4 +1,4 @@
-"""Voice subsystem: Doubao client, audio capture, push-to-talk controller."""
+"""Voice subsystem: Doubao/Grok clients, audio capture, push-to-talk controller."""
 
 from .audio import AudioCapture, AudioCaptureError, AudioConfig
 from .controller import State, TranscriptUpdate, VoiceController
@@ -8,7 +8,6 @@ from .doubao import (
     DoubaoFrameCodec,
     DoubaoProtocolError,
     Frame,
-    TranscriptEvent,
     auth_headers,
     build_request_meta,
     encode_audio,
@@ -16,6 +15,12 @@ from .doubao import (
     extract_full_text,
     extract_text,
 )
+from .grok_stt import (
+    GrokProtocolError,
+    GrokSttClient,
+    GrokSttCredentials,
+)
+from .types import TranscriptEvent
 
 __all__ = [
     "AudioCapture",
@@ -26,6 +31,9 @@ __all__ = [
     "DoubaoFrameCodec",
     "DoubaoProtocolError",
     "Frame",
+    "GrokProtocolError",
+    "GrokSttClient",
+    "GrokSttCredentials",
     "State",
     "TranscriptEvent",
     "TranscriptUpdate",

@@ -43,6 +43,9 @@ import uuid
 from dataclasses import dataclass
 from typing import AsyncIterator, Iterable
 
+from .types import TranscriptEvent
+from .ws_util import ws_connect
+
 PROTOCOL_VERSION = 0b0001
 DEFAULT_HEADER_SIZE = 0b0001  # in 32-bit units, so a 4-byte header
 
@@ -387,18 +390,7 @@ class DoubaoCredentials:
     endpoint: str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
 
 
-@dataclass
-class TranscriptEvent:
-    """One transcription update from the server.
-
-    ``text`` is the server's accumulated text so far. ``is_final`` is
-    True when this is the last result of the utterance (Doubao's
-    ``definite=true`` family).
-    """
-
-    text: str
-    is_final: bool
-    raw: dict
+# TranscriptEvent is imported from types.py and re-exported for back-compat.
 
 
 class DoubaoClient:
@@ -436,19 +428,20 @@ class DoubaoClient:
                 "websockets package required for live Doubao calls; "
                 "install it via pip install websockets"
             ) from exc
+        # websockets is only checked for presence; connect goes through
+        # ws_connect (KD-16 header compat for websockets 12–15).
+        _ = websockets
         last_exc: BaseException | None = None
         for attempt, delay in enumerate(self._CONNECT_BACKOFF_S):
             if delay:
                 await asyncio.sleep(delay)
             try:
-                self._ws = await websockets.connect(
+                self._ws = await ws_connect(
                     self._creds.endpoint,
-                    additional_headers=list(
-                        auth_headers(
-                            app_key=self._creds.app_key,
-                            access_key=self._creds.access_key,
-                            resource_id=self._creds.resource_id,
-                        ).items()
+                    headers=auth_headers(
+                        app_key=self._creds.app_key,
+                        access_key=self._creds.access_key,
+                        resource_id=self._creds.resource_id,
                     ),
                     max_size=None,
                 )
