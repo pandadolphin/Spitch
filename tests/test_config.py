@@ -12,7 +12,12 @@ from pathlib import Path
 
 from spitch.config import (
     DEFAULT_CONFIG,
+    FINALIZE_MIN_S,
+    FINALIZE_SLACK_S,
+    LINGER_MAX_S,
     ConfigError,
+    _finalize_deadlines,
+    _section,
     clear_verified,
     config_dir,
     config_path,
@@ -154,6 +159,37 @@ class IsCompleteTests(unittest.TestCase):
         cfg["doubao"]["access_key"] = "y"
         self.assertFalse(is_complete(cfg))
 
+    def test_grok_complete_with_key_and_endpoint(self):
+        cfg = default_config()
+        cfg["provider"] = "grok"
+        cfg["grok"]["api_key"] = "xai-test-key"
+        # endpoint defaulted
+        self.assertTrue(is_complete(cfg))
+
+    def test_grok_missing_key_incomplete(self):
+        cfg = default_config()
+        cfg["provider"] = "grok"
+        cfg["grok"]["api_key"] = ""
+        self.assertFalse(is_complete(cfg))
+
+    def test_default_includes_grok_section(self):
+        cfg = default_config()
+        self.assertIn("grok", cfg)
+        self.assertEqual(cfg["grok"]["endpoint"], "wss://api.x.ai/v1/stt")
+        self.assertTrue(cfg["grok"]["interim_results"])
+        self.assertTrue(cfg["grok"]["send_finalize_on_eos"])
+
+    def test_load_merges_missing_grok_defaults(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "config.json"
+            p.write_text(
+                json.dumps({"provider": "doubao", "doubao": {"app_key": "AK"}}),
+                encoding="utf-8",
+            )
+            cfg = load_config(p)
+            self.assertIn("grok", cfg)
+            self.assertEqual(cfg["grok"]["endpoint"], DEFAULT_CONFIG["grok"]["endpoint"])
+
 
 class MarkVerifiedTests(unittest.TestCase):
     def test_sets_iso_z_for_aware_utc(self):
@@ -259,6 +295,150 @@ class CredentialsSignatureTests(unittest.TestCase):
         b["doubao"]["app_key"] = "AK"
         b["doubao"]["resource_id"] = "different.resource"
         self.assertNotEqual(credentials_signature(a), credentials_signature(b))
+
+    def test_grok_signature_is_provider_key_endpoint_only(self):
+        a = default_config()
+        a["provider"] = "grok"
+        a["grok"]["api_key"] = "k"
+        a["grok"]["language"] = "en"
+        b = default_config()
+        b["provider"] = "grok"
+        b["grok"]["api_key"] = "k"
+        b["grok"]["language"] = "zh"  # non-auth
+        b["grok"]["filler_words"] = True
+        self.assertEqual(credentials_signature(a), credentials_signature(b))
+        self.assertEqual(
+            credentials_signature(a),
+            ("grok", "k", a["grok"]["endpoint"]),
+        )
+
+
+class VerifiedStampHardeningTests(unittest.TestCase):
+    """KD-18: V1–V5 — legacy unsigned stamps are Doubao-only."""
+
+    def _doubao_complete(self):
+        cfg = default_config()
+        cfg["provider"] = "doubao"
+        cfg["doubao"]["app_key"] = "x"
+        cfg["doubao"]["access_key"] = "y"
+        return cfg
+
+    def _grok_complete(self):
+        cfg = default_config()
+        cfg["provider"] = "grok"
+        cfg["grok"]["api_key"] = "xai-test"
+        return cfg
+
+    def test_v1_doubao_unsigned_verified_at_only(self):
+        cfg = self._doubao_complete()
+        cfg["verified_at"] = "2026-05-03T14:00:00Z"
+        # no verified_signature
+        self.assertTrue(is_verified(cfg))
+
+    def test_v2_grok_unsigned_verified_at_only(self):
+        cfg = self._grok_complete()
+        cfg["verified_at"] = "2026-05-03T14:00:00Z"
+        self.assertFalse(is_verified(cfg))
+
+    def test_v3_cross_provider_doubao_stamp_does_not_authorize_grok(self):
+        cfg = self._doubao_complete()
+        cfg["verified_at"] = "2026-05-03T14:00:00Z"
+        self.assertTrue(is_verified(cfg))
+        cfg["provider"] = "grok"
+        cfg["grok"]["api_key"] = "xai-test"
+        self.assertFalse(is_verified(cfg))
+
+    def test_v4_grok_matching_signature(self):
+        cfg = mark_verified(self._grok_complete())
+        self.assertTrue(is_verified(cfg))
+
+    def test_v5_grok_wrong_signature(self):
+        cfg = self._grok_complete()
+        cfg["verified_at"] = "2026-05-03T14:00:00Z"
+        cfg["verified_signature"] = "deadbeefdeadbeef"
+        self.assertFalse(is_verified(cfg))
+
+
+class MappingGuardTests(unittest.TestCase):
+    """KD-22: M1–M3 malformed nested sections must not crash."""
+
+    def test_m1_grok_section_non_mapping(self):
+        for bad in ("bad", ["x"], None, 42):
+            cfg = default_config()
+            cfg["provider"] = "grok"
+            cfg["grok"] = bad  # type: ignore[assignment]
+            self.assertFalse(is_complete(cfg))
+            # credentials_signature must not TypeError
+            sig = credentials_signature(cfg)
+            self.assertEqual(sig[0], "grok")
+
+    def test_m2_doubao_section_list(self):
+        cfg = default_config()
+        cfg["provider"] = "doubao"
+        cfg["doubao"] = ["x"]  # type: ignore[assignment]
+        self.assertFalse(is_complete(cfg))
+        credentials_signature(cfg)  # no crash
+
+    def test_section_helper(self):
+        self.assertEqual(_section({"audio": "bad"}, "audio"), {})
+        self.assertEqual(_section({"audio": {"a": 1}}, "audio")["a"], 1)
+
+
+class FinalizeDeadlineTests(unittest.TestCase):
+    """KD-12: linger-safe inequality; M3 / M3b / M3c non-finite inputs."""
+
+    def test_inject_longer_than_controller_plus_linger_plus_slack(self):
+        for linger_ms in (0, 300, 1000):
+            for final_wait in (5.0, 30.0):
+                cfg = default_config()
+                cfg["inject"]["final_wait_seconds"] = final_wait
+                cfg["audio"]["release_linger_ms"] = linger_ms
+                controller_t, inject_t = _finalize_deadlines(cfg)
+                linger_s = min(linger_ms / 1000.0, LINGER_MAX_S)
+                self.assertGreaterEqual(
+                    inject_t,
+                    controller_t + linger_s + FINALIZE_SLACK_S - 1e-9,
+                )
+                self.assertGreaterEqual(controller_t, FINALIZE_MIN_S)
+                self.assertTrue(controller_t == controller_t)  # finite
+                self.assertTrue(inject_t == inject_t)
+
+    def test_m3_audio_inject_non_mapping_safe_defaults(self):
+        cfg = default_config()
+        cfg["audio"] = "bad"  # type: ignore[assignment]
+        cfg["inject"] = []  # type: ignore[assignment]
+        controller_t, inject_t = _finalize_deadlines(cfg)
+        self.assertGreaterEqual(controller_t, FINALIZE_MIN_S)
+        self.assertGreater(inject_t, controller_t)
+
+    def test_m3b_non_finite_final_wait(self):
+        for bad in ("nan", "inf", None, -1, float("nan"), float("inf")):
+            cfg = default_config()
+            cfg["inject"]["final_wait_seconds"] = bad
+            controller_t, inject_t = _finalize_deadlines(cfg)
+            import math
+            self.assertTrue(math.isfinite(controller_t))
+            self.assertTrue(math.isfinite(inject_t))
+            self.assertGreater(controller_t, 0)
+            self.assertGreater(inject_t, controller_t)
+
+    def test_m3c_non_finite_or_huge_linger(self):
+        for bad in ("nan", 1e12, float("nan")):
+            cfg = default_config()
+            cfg["audio"]["release_linger_ms"] = bad
+            controller_t, inject_t = _finalize_deadlines(cfg)
+            import math
+            self.assertTrue(math.isfinite(inject_t))
+            # linger contribution capped
+            self.assertLessEqual(
+                inject_t - controller_t - FINALIZE_SLACK_S,
+                LINGER_MAX_S + 1e-9,
+            )
+
+    def test_stock_defaults(self):
+        controller_t, inject_t = _finalize_deadlines(default_config())
+        self.assertAlmostEqual(controller_t, 30.0)
+        self.assertAlmostEqual(inject_t, 30.0 + 0.3 + FINALIZE_SLACK_S)
 
 
 if __name__ == "__main__":

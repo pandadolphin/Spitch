@@ -1,5 +1,5 @@
 """Push-to-talk voice controller — the bridge between hotkey events,
-the audio capture layer, and the Doubao streaming client.
+the audio capture layer, and a provider-agnostic streaming client.
 
 The controller's lifecycle:
 
@@ -15,6 +15,11 @@ runs in another daemon thread, so the caller's main thread stays
 responsive while a recording is in flight. The controller exposes
 ``press()`` / ``release()`` / ``cancel()`` from the main thread and
 is otherwise fully internal.
+
+KD-15: cancel actively cancels the published session task (including
+hang during ``__aenter__`` / blocked ``recv``). Publish loop+task under
+lock as early as possible; if ``_cancel`` is already set at publish,
+cancel the task immediately (C0).
 """
 
 from __future__ import annotations
@@ -43,7 +48,7 @@ class TranscriptUpdate:
 
 
 class StreamingClient(Protocol):
-    """The slice of :class:`spitch.voice.doubao.DoubaoClient` we depend on."""
+    """The slice of DoubaoClient / GrokSttClient we depend on."""
 
     async def __aenter__(self) -> "StreamingClient": ...
     async def __aexit__(self, exc_type, exc, tb) -> None: ...
@@ -51,10 +56,10 @@ class StreamingClient(Protocol):
 
 
 class VoiceController:
-    """State machine for hold-to-talk Doubao transcription.
+    """State machine for hold-to-talk transcription.
 
     ``client_factory`` returns a fresh streaming client per press —
-    typically ``lambda: DoubaoClient(creds, sample_rate=...)``. Tests
+    typically ``make_client_factory(cfg, sample_rate=...)``. Tests
     can pass a fake client.
 
     ``audio`` is an :class:`AudioCapture` (or duck-typed equivalent —
@@ -96,8 +101,14 @@ class VoiceController:
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._latest_text = ""
+        # Commit-once guard: at most one on_final per session (rev 7).
+        # Cleared on press; set by _commit_final on success/fallback paths.
+        self._final_committed = False
         self._worker: threading.Thread | None = None
         self._error_recovery_timer: threading.Timer | None = None
+        # KD-15: session loop + task published under lock for cross-thread cancel.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._session_task: asyncio.Task | None = None
 
     # -- introspection -------------------------------------------------
 
@@ -116,7 +127,7 @@ class VoiceController:
 
         ERROR is treated as a soft latch — the next press resets and
         starts fresh. This keeps the daemon usable after transient
-        Doubao / WebSocket / network failures without forcing a
+        ASR / WebSocket / network failures without forcing a
         process restart.
         """
         with self._lock:
@@ -124,6 +135,9 @@ class VoiceController:
                 return False
             self._cancel.clear()
             self._latest_text = ""
+            self._final_committed = False
+            self._loop = None
+            self._session_task = None
             self._set_state(State.RECORDING)
         try:
             self._audio.start()
@@ -164,12 +178,30 @@ class VoiceController:
         self._audio.stop()
 
     def cancel(self) -> None:
-        """Abort: stop capture, signal cancellation, no commit."""
+        """Abort: stop capture, signal cancellation, cancel session task.
+
+        KD-15: set flag + stop audio; under lock read loop/task; schedule
+        ``task.cancel`` via ``call_soon_threadsafe`` (C4: RuntimeError-safe).
+        If the worker has not published yet, the flag alone is enough —
+        publish protocol cancels a newly published task when ``_cancel``
+        is already set (C0).
+        """
         with self._lock:
             if self._state == State.IDLE:
                 return
+            loop = self._loop
+            task = self._session_task
         self._cancel.set()
         self._audio.stop()
+        if task is not None and loop is not None:
+            try:
+                if not loop.is_closed():
+                    loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                # Loop closed between is_closed() check and schedule, or
+                # call_soon_threadsafe rejected a dead loop — treat as
+                # already-terminating session (C4). Do not raise to caller.
+                pass
 
     # -- internals -----------------------------------------------------
 
@@ -203,6 +235,26 @@ class VoiceController:
                 return
             self._set_state(State.IDLE)
 
+    def _commit_final(self, text: str) -> bool:
+        """Deliver ``on_final`` at most once per session (no dual commit).
+
+        Returns True if this call was the owner that committed. Cancel
+        path and empty text never commit.
+        """
+        if self._cancel.is_set():
+            return False
+        if not text:
+            return False
+        with self._lock:
+            if self._final_committed:
+                return False
+            self._final_committed = True
+        try:
+            self._on_final(text)
+        except Exception:
+            pass
+        return True
+
     def _audio_iter(self) -> Iterator[bytes]:
         """PCM iterator that yields until capture stops or cancel fires."""
         for chunk in self._audio.chunks():
@@ -214,8 +266,12 @@ class VoiceController:
         loop = asyncio.new_event_loop()
         errored = False
         try:
+            asyncio.set_event_loop(loop)
             try:
-                loop.run_until_complete(self._session_coro())
+                loop.run_until_complete(self._session_main(loop))
+            except asyncio.CancelledError:
+                # Cancel path — clean, not an error.
+                pass
             except Exception as exc:
                 errored = True
                 # Re-raise the original — _on_error wraps in a richer
@@ -224,17 +280,21 @@ class VoiceController:
                 wrapped = type(exc).__name__ + ": " + (str(exc) or repr(exc))
                 self._on_error(RuntimeError(wrapped))
             finally:
-                # Drain async-generator finalizers (the Doubao stream
-                # and the audio _async_chunks generator) before tearing
-                # the loop down — otherwise we'd leak "Task was
-                # destroyed but it is pending!" warnings into the test
-                # output and mask future real leaks.
+                # Drain async-generator finalizers before tearing the
+                # loop down — otherwise we'd leak "Task was destroyed
+                # but it is pending!" warnings into the test output.
                 try:
                     loop.run_until_complete(loop.shutdown_asyncgens())
                 except Exception:
                     pass
         finally:
-            loop.close()
+            with self._lock:
+                self._session_task = None
+                self._loop = None
+            try:
+                loop.close()
+            except Exception:
+                pass
             # Belt-and-suspenders: stop the mic regardless of how we
             # exited. A clean exit (server sent definite=true while
             # still RECORDING, never reached release()) would otherwise
@@ -249,7 +309,23 @@ class VoiceController:
             # stop() above would tear down the *new* session's mic.
             self._set_state(State.ERROR if errored else State.IDLE)
 
-    async def _session_coro(self) -> None:
+    async def _session_main(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Publish session task under lock ASAP, then await it (KD-15 / C0)."""
+        session_task = loop.create_task(self._session_body())
+        with self._lock:
+            self._loop = loop
+            self._session_task = session_task
+            already = self._cancel.is_set()
+        if already:
+            # Cancel was requested before publish — do not start hung work
+            session_task.cancel()
+        try:
+            await session_task
+        except asyncio.CancelledError:
+            # Cancel path: no on_final (guarded also by _commit_final)
+            return
+
+    async def _session_body(self) -> None:
         import logging
         log = logging.getLogger("spitch.voice")
         log.info("session: starting client_factory")
@@ -273,6 +349,8 @@ class VoiceController:
 
         log.info("session: connecting to ASR endpoint")
         async with client as live:
+            if self._cancel.is_set():
+                return
             log.info("session: connected, starting stream")
             chunks_gen = _async_chunks()
             stream = live.stream(chunks_gen).__aiter__()
@@ -296,6 +374,12 @@ class VoiceController:
                 The tray label / inject text always show:
 
                     "".join(confirmed_finals) + current_in_progress
+
+                Multi-provider note (KD-5): the non-utterance branch
+                (``evt.text``) is the Grok / test / provider-neutral
+                path. Clients that do not publish Doubao-shaped
+                ``result.utterances`` must put session-normalized text
+                on ``evt.text``. Grok never attaches utterances.
                 """
                 confirmed_finals: list[str] = []
                 last_text = ""
@@ -334,9 +418,9 @@ class VoiceController:
                         if saw_utterances:
                             full = "".join(confirmed_finals) + current_in_progress
                         else:
-                            # No utterances[] in payload — trust evt.text
-                            # as-is (single-utterance fast path / fake
-                            # streaming clients in tests / probe path).
+                            # No utterances[] — multi-provider / test path:
+                            # trust evt.text as session-normalized text
+                            # (Grok accumulator full text; FakeStreamingClient).
                             full = evt.text or ""
                         if full:
                             last_text = full
@@ -344,24 +428,35 @@ class VoiceController:
                             self._on_partial(full)
                     # Stream ended normally — commit the accumulated text.
                     if last_text and not self._cancel.is_set():
-                        self._on_final(last_text)
+                        self._commit_final(last_text)
                         return True
                     return False
+                except asyncio.CancelledError:
+                    # Cancel path: no on_final
+                    raise
                 except Exception:
+                    # Single-owner: _commit_final is commit-once so outer
+                    # except cannot dual-fire on_final (rev 7).
                     if not self._cancel.is_set() and (last_text or self._latest_text):
-                        self._on_final(last_text or self._latest_text)
+                        self._commit_final(last_text or self._latest_text)
                     raise
 
             consume_task: asyncio.Task | None = None
             try:
                 # Race the stream against the finalize-wall: if the user
                 # has released the talk key (state FINALIZING) and the
-                # server still hasn't sent definite=true after
+                # server still hasn't sent a session final after
                 # finalize_timeout seconds, we commit the latest partial
-                # rather than block the daemon indefinitely. PRD risk row
-                # "Latency between key release and Doubao final result".
+                # rather than block the daemon indefinitely.
                 consume_task = asyncio.create_task(_consume())
                 while not consume_task.done():
+                    if self._cancel.is_set():
+                        consume_task.cancel()
+                        try:
+                            await consume_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        return
                     if self._state == State.FINALIZING:
                         try:
                             committed = await asyncio.wait_for(
@@ -369,7 +464,7 @@ class VoiceController:
                                 timeout=self._finalize_timeout,
                             )
                             if not committed and not self._cancel.is_set() and self._latest_text:
-                                self._on_final(self._latest_text)
+                                self._commit_final(self._latest_text)
                             return
                         except asyncio.TimeoutError:
                             consume_task.cancel()
@@ -378,7 +473,7 @@ class VoiceController:
                             except (asyncio.CancelledError, Exception):
                                 pass
                             if not self._cancel.is_set() and self._latest_text:
-                                self._on_final(self._latest_text)
+                                self._commit_final(self._latest_text)
                             return
                     else:
                         # still RECORDING — short tick so we re-check state.
@@ -390,10 +485,13 @@ class VoiceController:
                             continue
                 committed = consume_task.result() if not consume_task.cancelled() else False
                 if not committed and not self._cancel.is_set() and self._latest_text:
-                    self._on_final(self._latest_text)
+                    self._commit_final(self._latest_text)
+            except asyncio.CancelledError:
+                # Session-task cancel (user cancel / C0) — no on_final.
+                raise
             except Exception:
                 if not self._cancel.is_set() and self._latest_text:
-                    self._on_final(self._latest_text)
+                    self._commit_final(self._latest_text)
                 raise
             finally:
                 # Drive the async generators through their cleanup path

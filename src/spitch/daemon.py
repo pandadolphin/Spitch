@@ -25,7 +25,14 @@ import time
 from typing import Callable, Optional
 
 from .cmdsock import CmdServer, default_socket_path
-from .config import is_complete, is_verified, load_config
+from .config import (
+    _finalize_deadlines,
+    _finite_float,
+    _section,
+    is_complete,
+    is_verified,
+    load_config,
+)
 from .eventbus import EventBus
 from .history import HistoryEntry, HistoryRing, default_history_path
 from .hotkey import HotkeyListener, parse_combo
@@ -35,10 +42,10 @@ from .tray import try_create as try_create_indicator
 from .voice import (
     AudioCapture,
     AudioConfig,
-    DoubaoClient,
-    DoubaoCredentials,
     State,
     VoiceController,
+    make_client_factory,
+    make_streaming_client,
 )
 
 log = logging.getLogger("spitch.daemon")
@@ -143,9 +150,10 @@ class SpitchDaemon:
         self._listener: Optional[HotkeyListener] = None
         self._voice: Optional[VoiceController] = None
         self._indicator = None  # set in run() if the typelib is present
-        self._finalize_timeout = float(
-            (cfg.get("inject") or {}).get("final_wait_seconds", 5.0)
-        )
+        # Overwritten in _build_voice with linger-safe inject deadline (KD-12).
+        # Fallback if someone constructs the daemon without calling run().
+        _, inject_t = _finalize_deadlines(cfg)
+        self._finalize_timeout = inject_t
         # Serialize the actual paste step. _finalize_and_inject runs on
         # a fresh thread per release, and a fast re-press scenario can
         # have N>1 inject threads alive at once (one waiting for the
@@ -199,39 +207,44 @@ class SpitchDaemon:
         pause_media = True
         try:
             pause_media = bool(
-                (cfg.get("audio") or {}).get("pause_media_on_talk", True)
+                _section(cfg, "audio").get("pause_media_on_talk", True)
             )
         except (TypeError, ValueError):
             pause_media = True
         self._media = MediaPauser(enabled=pause_media)
 
     def _build_voice(self) -> VoiceController:
-        d = self._cfg["doubao"]
-        creds = DoubaoCredentials(
-            app_key=d["app_key"],
-            access_key=d["access_key"],
-            resource_id=d.get("resource_id", "volc.bigasr.sauc.duration"),
-            endpoint=d.get(
-                "endpoint",
-                "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
-            ),
-        )
-        audio_cfg = self._cfg.get("audio") or {}
-        sample_rate = audio_cfg.get("sample_rate", 16000)
+        audio_cfg = _section(self._cfg, "audio")
         try:
-            prebuffer_ms = int(audio_cfg.get("prebuffer_ms", 500))
+            sample_rate = int(_finite_float(audio_cfg.get("sample_rate", 16000), 16000))
+        except (TypeError, ValueError):
+            sample_rate = 16000
+        if sample_rate <= 0:
+            sample_rate = 16000
+        try:
+            prebuffer_ms = int(_finite_float(audio_cfg.get("prebuffer_ms", 500), 500))
         except (TypeError, ValueError):
             prebuffer_ms = 500
         self._audio = AudioCapture(
             AudioConfig(sample_rate=sample_rate, prebuffer_ms=prebuffer_ms)
         )
+        controller_t, inject_t = _finalize_deadlines(self._cfg)
+        self._finalize_timeout = inject_t  # pending.get(timeout=...) in inject
+        log.info(
+            "finalize deadlines: controller=%.1fs inject=%.1fs (provider=%s)",
+            controller_t,
+            inject_t,
+            self._cfg.get("provider") or "doubao",
+        )
+        factory = make_client_factory(self._cfg, sample_rate=sample_rate)
         return VoiceController(
-            client_factory=lambda: DoubaoClient(creds, sample_rate=sample_rate),
+            client_factory=factory,
             audio=self._audio,
             on_partial=self._on_partial,
             on_final=self._on_final,
             on_error=self._on_error,
             on_state=self._on_state,
+            finalize_timeout=controller_t,  # KD-12: was defaulting to 2.0
         )
 
     # -- voice callbacks ----------------------------------------------
@@ -367,7 +380,7 @@ class SpitchDaemon:
 
     def _on_press(self) -> None:
         if self._voice is None:
-            _notify("Spitch", "Not configured — run spitch-config")
+            _notify("Spitch", "configure Spitch first — run spitch-config")
             return
         # If the previous press is still in its release-linger window,
         # fire it now so the controller can transition to IDLE before
@@ -449,7 +462,10 @@ class SpitchDaemon:
         # recognizer finish processing the tail before EOS arrives.
         try:
             linger_ms = int(
-                (self._cfg.get("audio") or {}).get("release_linger_ms", 300)
+                _finite_float(
+                    _section(self._cfg, "audio").get("release_linger_ms", 300),
+                    300.0,
+                )
             )
         except (TypeError, ValueError):
             linger_ms = 300
@@ -602,7 +618,10 @@ class SpitchDaemon:
             log.exception("media resume on salmon release failed")
         try:
             linger_ms = int(
-                (self._cfg.get("audio") or {}).get("release_linger_ms", 300)
+                _finite_float(
+                    _section(self._cfg, "audio").get("release_linger_ms", 300),
+                    300.0,
+                )
             )
         except (TypeError, ValueError):
             linger_ms = 300
@@ -735,10 +754,12 @@ class SpitchDaemon:
         Used both by _finalize_and_inject (live press) and by
         cmdsock repaste handlers (console / cli).
         """
-        inject_cfg = self._cfg.get("inject") or {}
+        inject_cfg = _section(self._cfg, "inject")
         keystroke = inject_cfg.get("paste_keystroke", "Ctrl+Shift+V")
         try:
-            restore_delay_ms = int(inject_cfg.get("restore_clipboard_delay_ms", 800))
+            restore_delay_ms = int(
+                _finite_float(inject_cfg.get("restore_clipboard_delay_ms", 800), 800)
+            )
         except (TypeError, ValueError):
             restore_delay_ms = 800
         with self._inject_lock:
@@ -819,7 +840,7 @@ class SpitchDaemon:
     def run(self) -> int:
         if not is_complete(self._cfg):
             print(
-                "spitch: configure Doubao first — run spitch-config",
+                "spitch: configure Spitch first — run spitch-config",
                 file=sys.stderr,
             )
             return 2
@@ -832,7 +853,7 @@ class SpitchDaemon:
             return 2
         self._voice = self._build_voice()
         combo = parse_combo(
-            (self._cfg.get("hotkey") or {}).get("talk_key", "Ctrl+Alt")
+            _section(self._cfg, "hotkey").get("talk_key", "Ctrl+Alt")
         )
         if not combo:
             print(
@@ -869,7 +890,7 @@ class SpitchDaemon:
         # salmon event bus instead of pasting. Default is "Super"
         # (single-modifier holds are opted in via allow_single_mod).
         # Setting hotkey.salmon_key to "" disables salmon mode.
-        salmon_spec = (self._cfg.get("hotkey") or {}).get("salmon_key", "")
+        salmon_spec = _section(self._cfg, "hotkey").get("salmon_key", "")
         salmon_combo = parse_combo(salmon_spec) if salmon_spec else []
         if salmon_combo:
             try:
@@ -906,13 +927,9 @@ class SpitchDaemon:
                 log.warning(
                     "could not pre-open mic (%s) — will open on press", exc
                 )
-        # Warm up the WebSocket path to Doubao so the first press
-        # doesn't pay the cold DNS + TCP + TLS + WS-upgrade latency
-        # (we've measured 5+ seconds on the first connect after a
-        # fresh boot — long enough that a short utterance can finish
-        # before the connection is even established, leaving the daemon
-        # with nothing to inject). Periodic re-warm in a background
-        # thread keeps the network path hot during idle stretches.
+        # Warm up the ASR WebSocket path so the first press doesn't pay
+        # cold DNS + TCP + TLS + WS-upgrade latency. Periodic re-warm
+        # keeps the network path hot during idle stretches.
         threading.Thread(
             target=self._network_warmup_loop,
             name="spitch-warmup",
@@ -994,7 +1011,7 @@ class SpitchDaemon:
         return 0
 
     def _network_warmup_loop(self) -> None:
-        """Pre-establish (then close) a WebSocket to Doubao on a timer.
+        """Pre-establish (then close) an ASR WebSocket on a timer.
 
         First connect after a cold boot can take 5+ seconds — DNS
         resolution + TCP handshake + TLS handshake + WS upgrade, none
@@ -1003,26 +1020,34 @@ class SpitchDaemon:
         waiting for the connection while the user already finishes
         speaking and releases. The session ends with no transcript.
 
-        This loop opens a probe connection on daemon start and then
-        every 4 minutes — short enough that the OS keeps DNS in
-        cache and the TLS resumption ticket stays warm, long enough
-        that we're not hammering Doubao's auth endpoint.
+        Provider branching (KD-9):
+          * doubao — connect-only (``__aenter__`` / ``__aexit__``);
+            setup continues on ``stream()``.
+          * grok — ``client.warmup()`` waits for ``transcript.created``
+            then closes; connect-only is insufficient for Grok ASR
+            readiness.
+
+        Interval remains 240 s.
         """
         import asyncio
-        d = self._cfg["doubao"]
-        creds = DoubaoCredentials(
-            app_key=d["app_key"],
-            access_key=d["access_key"],
-            resource_id=d.get("resource_id", "volc.bigasr.sauc.duration"),
-            endpoint=d.get(
-                "endpoint",
-                "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
-            ),
-        )
 
-        async def _one_probe() -> float:
+        audio_cfg = _section(self._cfg, "audio")
+        try:
+            sample_rate = int(
+                _finite_float(audio_cfg.get("sample_rate", 16000), 16000)
+            )
+        except (TypeError, ValueError):
+            sample_rate = 16000
+        if sample_rate <= 0:
+            sample_rate = 16000
+        provider = self._cfg.get("provider") or "doubao"
+
+        async def _one_warmup() -> float:
+            client = make_streaming_client(self._cfg, sample_rate=sample_rate)
+            if provider == "grok":
+                # GrokSttClient.warmup: connect + wait transcript.created + close
+                return await client.warmup(timeout=5.0)  # type: ignore[attr-defined]
             t0 = time.time()
-            client = DoubaoClient(creds)
             try:
                 await client.__aenter__()
             finally:
@@ -1036,7 +1061,7 @@ class SpitchDaemon:
             try:
                 loop = asyncio.new_event_loop()
                 try:
-                    elapsed = loop.run_until_complete(_one_probe())
+                    elapsed = loop.run_until_complete(_one_warmup())
                 finally:
                     loop.close()
                 log.info("network warmup: %.2fs", elapsed)

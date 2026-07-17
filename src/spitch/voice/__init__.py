@@ -15,6 +15,7 @@ from .doubao import (
     extract_full_text,
     extract_text,
 )
+from .factory import make_client_factory, make_streaming_client
 from .grok_stt import (
     GrokProtocolError,
     GrokSttClient,
@@ -44,4 +45,6 @@ __all__ = [
     "encode_full_request",
     "extract_full_text",
     "extract_text",
+    "make_client_factory",
+    "make_streaming_client",
 ]

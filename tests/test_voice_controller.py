@@ -344,6 +344,282 @@ class VoiceControllerTests(unittest.TestCase):
         self.assertEqual(finals, ["你能听见吗？好的，再见。"])
 
 
+class CancelReliabilityTests(unittest.TestCase):
+    """KD-15: C0–C4 session-task cancel reliability."""
+
+    def _wait_state(self, ctrl: VoiceController, want: State, timeout: float = 2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if ctrl.state == want:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_c0_cancel_before_publish(self):
+        """cancel() immediately after press(), before worker publishes.
+
+        Flag alone must abort the session at publish (C0); no on_final.
+        """
+        entered = threading.Event()
+        release_enter = threading.Event()
+
+        class SlowConnectClient:
+            async def __aenter__(self):
+                entered.set()
+                # Block until test allows, or until cancelled
+                try:
+                    await asyncio.wait_for(
+                        asyncio.get_running_loop().run_in_executor(
+                            None, release_enter.wait
+                        ),
+                        timeout=5.0,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def stream(self, audio_iter):
+                async for _ in audio_iter:
+                    pass
+                if False:
+                    yield  # pragma: no cover
+
+        finals: list[str] = []
+        # Gate so cancel can race before publish: factory delays slightly
+        factory_started = threading.Event()
+
+        def factory():
+            factory_started.set()
+            # Tiny yield so cancel() from main thread can land first
+            time.sleep(0.05)
+            return SlowConnectClient()
+
+        ctrl = VoiceController(
+            client_factory=factory,
+            audio=FakeAudio([b"\x00" * 32] * 5),
+            on_final=finals.append,
+            finalize_timeout=1.0,
+        )
+        self.assertTrue(ctrl.press())
+        # Cancel ASAP — likely before or just as worker publishes
+        ctrl.cancel()
+        release_enter.set()  # unblock if connect already running
+        self.assertTrue(
+            self._wait_state(ctrl, State.IDLE, timeout=3.0)
+            or self._wait_state(ctrl, State.ERROR, timeout=0.1)
+        )
+        # Recoverable for next press
+        self.assertIn(ctrl.state, (State.IDLE, State.ERROR))
+        self.assertEqual(finals, [])
+
+    def test_c1_cancel_during_hung_aenter(self):
+        """cancel during hung __aenter__ (after task published)."""
+        entered = threading.Event()
+
+        class HungConnectClient:
+            async def __aenter__(self):
+                entered.set()
+                await asyncio.Future()  # hang forever until cancelled
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def stream(self, audio_iter):
+                if False:
+                    yield  # pragma: no cover
+
+        finals: list[str] = []
+        ctrl = VoiceController(
+            client_factory=lambda: HungConnectClient(),
+            audio=FakeAudio([b"\x00" * 32]),
+            on_final=finals.append,
+        )
+        self.assertTrue(ctrl.press())
+        self.assertTrue(entered.wait(timeout=2.0))
+        # Give publish a moment
+        time.sleep(0.05)
+        ctrl.cancel()
+        self.assertTrue(
+            self._wait_state(ctrl, State.IDLE, timeout=3.0)
+            or self._wait_state(ctrl, State.ERROR, timeout=0.1)
+        )
+        self.assertEqual(finals, [])
+
+    def test_c2_cancel_during_blocked_recv(self):
+        """cancel during permanently blocked stream recv."""
+
+        class BlockedRecvClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def stream(self, audio_iter):
+                async for _ in audio_iter:
+                    pass
+                await asyncio.Future()  # hang on "recv"
+                if False:
+                    yield  # pragma: no cover
+
+        finals: list[str] = []
+        ctrl = VoiceController(
+            client_factory=lambda: BlockedRecvClient(),
+            audio=FakeAudio([b"\x00" * 32, b"\x01" * 32]),
+            on_final=finals.append,
+            finalize_timeout=5.0,
+        )
+        self.assertTrue(ctrl.press())
+        time.sleep(0.1)
+        ctrl.cancel()
+        self.assertTrue(
+            self._wait_state(ctrl, State.IDLE, timeout=3.0)
+            or self._wait_state(ctrl, State.ERROR, timeout=0.1)
+        )
+        self.assertEqual(finals, [])
+
+    def test_c3_cancel_mid_partials(self):
+        finals: list[str] = []
+        partials: list[str] = []
+
+        class SlowPartialsClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def stream(self, audio_iter):
+                yield TranscriptEvent("partial-1", False, {})
+                await asyncio.sleep(0.05)
+                yield TranscriptEvent("partial-2", False, {})
+                await asyncio.sleep(10.0)
+                yield TranscriptEvent("final", True, {})
+
+        ctrl = VoiceController(
+            client_factory=lambda: SlowPartialsClient(),
+            audio=FakeAudio([b"x" * 64] * 5),
+            on_partial=partials.append,
+            on_final=finals.append,
+        )
+        ctrl.press()
+        time.sleep(0.15)
+        ctrl.cancel()
+        self.assertTrue(
+            self._wait_state(ctrl, State.IDLE, timeout=3.0)
+            or self._wait_state(ctrl, State.ERROR, timeout=0.1)
+        )
+        self.assertEqual(finals, [])
+
+    def test_c4_cancel_races_loop_teardown(self):
+        """cancel after session already ended — no crash, no on_final."""
+        events = [TranscriptEvent("ok", True, {})]
+        finals: list[str] = []
+        ctrl = VoiceController(
+            client_factory=lambda: FakeStreamingClient(events),
+            audio=FakeAudio([b"x" * 32]),
+            on_final=finals.append,
+        )
+        ctrl.press()
+        time.sleep(0.05)
+        ctrl.release()
+        self.assertTrue(self._wait_state(ctrl, State.IDLE, timeout=3.0))
+        # Race cancel after teardown — must not raise
+        ctrl.cancel()
+        time.sleep(0.05)
+        # final from successful path already committed once
+        self.assertEqual(finals, ["ok"])
+
+
+class SingleOwnerFinalTests(unittest.TestCase):
+    """S3b + dual-exception: at most one on_final per session."""
+
+    def _wait_state(self, ctrl: VoiceController, want: State, timeout: float = 2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if ctrl.state == want:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_s3b_silent_post_eos_finalize_timeout_exactly_one_on_final(self):
+        """Release → FINALIZING; silent post-EOS; short finalize_timeout
+        → exactly one on_final with latest partial; state not ERROR.
+        """
+
+        class SilentAfterPartialClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def stream(self, audio_iter):
+                async for _ in audio_iter:
+                    pass
+                yield TranscriptEvent("hello partial", False, {})
+                # Silent forever after partial (no transcript.done)
+                while True:
+                    await asyncio.sleep(0.1)
+
+        finals: list[str] = []
+        errors: list[BaseException] = []
+        ctrl = VoiceController(
+            client_factory=lambda: SilentAfterPartialClient(),
+            audio=FakeAudio([b"\x01" * 320]),
+            on_final=finals.append,
+            on_error=errors.append,
+            finalize_timeout=0.25,
+        )
+        ctrl.press()
+        time.sleep(0.05)
+        ctrl.release()
+        self.assertTrue(self._wait_state(ctrl, State.IDLE, timeout=3.0))
+        self.assertEqual(finals, ["hello partial"])
+        self.assertEqual(errors, [])
+
+    def test_dual_exception_path_single_on_final(self):
+        """Exception mid-stream must not dual-commit on_final (inner+outer)."""
+
+        class ExplodingClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def stream(self, audio_iter):
+                async for _ in audio_iter:
+                    pass
+                yield TranscriptEvent("got text", False, {})
+                raise RuntimeError("simulated stream failure")
+
+        finals: list[str] = []
+        errors: list[BaseException] = []
+        ctrl = VoiceController(
+            client_factory=lambda: ExplodingClient(),
+            audio=FakeAudio([b"\x01" * 64]),
+            on_final=finals.append,
+            on_error=errors.append,
+            finalize_timeout=1.0,
+        )
+        ctrl.press()
+        time.sleep(0.05)
+        ctrl.release()
+        self.assertTrue(
+            self._wait_state(ctrl, State.ERROR, timeout=3.0)
+            or self._wait_state(ctrl, State.IDLE, timeout=0.5)
+        )
+        self.assertLessEqual(len(finals), 1)
+        if finals:
+            self.assertEqual(finals[0], "got text")
+        self.assertEqual(len(errors), 1)
+
+
 class ErrorRecoveryTests(unittest.TestCase):
     """ERROR state should auto-flip back to IDLE after a brief idle
     period so the tray label stops asserting "出错" long after a

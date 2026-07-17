@@ -30,6 +30,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "resource_id": "volc.bigasr.sauc.duration",
         "endpoint": "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
     },
+    "grok": {
+        "api_key": "",
+        "endpoint": "wss://api.x.ai/v1/stt",
+        "language": "",
+        "interim_results": True,
+        "endpointing_ms": None,
+        "filler_words": False,
+        "send_finalize_on_eos": True,
+    },
     "audio": {
         "device": None,
         "sample_rate": 16000,
@@ -195,37 +204,89 @@ def _signature_fingerprint(sig: tuple) -> str:
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
-def is_complete(cfg: Mapping[str, Any]) -> bool:
-    """True iff the user has supplied the credentials needed to talk to Doubao.
+def _section(cfg: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    """Return nested config section if it is a Mapping; else empty dict (KD-22).
 
-    A complete config has ``provider == "doubao"`` and non-empty
-    ``app_key``, ``access_key``, and ``endpoint``. This is a *necessary*
-    but not sufficient condition for voice usage — see :func:`is_verified`.
+    Hand-edited JSON can put a string/list/null under ``doubao`` / ``grok`` /
+    ``audio`` / ``inject``. Callers must not ``.get()`` on a non-mapping.
     """
-    if cfg.get("provider") != "doubao":
-        return False
-    d = cfg.get("doubao") or {}
-    if not isinstance(d, Mapping):
-        return False
-    return bool(d.get("app_key")) and bool(d.get("access_key")) and bool(d.get("endpoint"))
+    raw = cfg.get(key)
+    return raw if isinstance(raw, Mapping) else {}
+
+
+# Finalize deadline math (KD-12) — used by daemon ``_build_voice`` and tests.
+FINALIZE_SLACK_S = 1.0
+FINALIZE_MIN_S = 5.0
+FINALIZE_MAX_S = 300.0  # 5 min hard cap
+LINGER_MAX_S = 5.0
+
+
+def _finite_float(value: Any, default: float) -> float:
+    """Parse a timeout-like number; reject nan/inf and non-numeric."""
+    import math
+
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(x):
+        return default
+    return x
+
+
+def _finalize_deadlines(cfg: Mapping[str, Any]) -> tuple[float, float]:
+    """Return ``(controller_finalize_timeout, inject_queue_timeout)``.
+
+    Inject thread starts at key-up (t=0). Controller enters FINALIZING only
+    after ``release_linger_ms``. So inject must wait longer than
+    controller + linger or ``on_final`` can land after inject already timed
+    out (transcript dropped). Both outputs are finite and positive.
+    """
+    inject_cfg = _section(cfg, "inject")
+    audio_cfg = _section(cfg, "audio")
+    final_wait = _finite_float(inject_cfg.get("final_wait_seconds", 30.0), 30.0)
+    if final_wait < 0:
+        final_wait = 30.0
+    final_wait = min(final_wait, FINALIZE_MAX_S)
+
+    linger_ms = _finite_float(audio_cfg.get("release_linger_ms", 300), 300.0)
+    linger_s = max(0.0, min(linger_ms / 1000.0, LINGER_MAX_S))
+
+    controller_t = max(final_wait, FINALIZE_MIN_S)
+    inject_t = controller_t + linger_s + FINALIZE_SLACK_S
+    return controller_t, inject_t
+
+
+def is_complete(cfg: Mapping[str, Any]) -> bool:
+    """True iff the user has supplied credentials for the configured provider.
+
+    Doubao requires non-empty ``app_key``, ``access_key``, and ``endpoint``.
+    Grok requires non-empty ``api_key`` and ``endpoint``. Nested sections
+    must be Mappings (KD-22); malformed sections are incomplete, not crashes.
+    Necessary but not sufficient for voice — see :func:`is_verified`.
+    """
+    provider = cfg.get("provider")
+    if provider == "doubao":
+        d = _section(cfg, "doubao")
+        return bool(d.get("app_key") and d.get("access_key") and d.get("endpoint"))
+    if provider == "grok":
+        g = _section(cfg, "grok")
+        return bool(g.get("api_key") and g.get("endpoint"))
+    return False
 
 
 def is_verified(cfg: Mapping[str, Any]) -> bool:
     """True iff the config is complete *and* a successful probe stamped *these*
     credentials.
 
-    GOAL.md requires the IME tell the user whether configuration succeeded
-    *before* allowing voice usage ("成功后就可以使用了"). The probe writes
-    ``verified_at`` only after a live Doubao handshake succeeded, and the
-    write also fingerprints the credentials it verified into
-    ``verified_signature``. If the user later edits the config (via the
-    dialog or by hand) to change keys, the fingerprint stops matching and
-    the gate closes again — preventing an old "good" stamp from
-    laundering new untested credentials.
+    The probe writes ``verified_at`` only after a live handshake succeeded,
+    and fingerprints the credentials into ``verified_signature``. If the
+    user later edits keys, the fingerprint stops matching.
 
-    Configs written by older Spitch builds that lack ``verified_signature``
-    are treated as verified iff ``verified_at`` is set; this keeps the
-    upgrade path painless without ever weakening the new gate.
+    KD-18: legacy unsigned stamps (``verified_at`` set, no
+    ``verified_signature``) are **Doubao-only**. Grok always requires a
+    matching signature so an old Doubao stamp cannot authorize unprobed
+    Grok credentials after a manual provider switch.
     """
     if not is_complete(cfg):
         return False
@@ -235,20 +296,26 @@ def is_verified(cfg: Mapping[str, Any]) -> bool:
     sig_fp = cfg.get("verified_signature")
     if isinstance(sig_fp, str) and sig_fp.strip():
         return sig_fp == _signature_fingerprint(credentials_signature(cfg))
-    return True
+    # Legacy path: unsigned stamp accepted only for doubao
+    if cfg.get("provider") == "doubao":
+        return True
+    return False
 
 
 def credentials_signature(cfg: Mapping[str, Any]) -> tuple:
     """Return a tuple identifying which credentials are stamped by ``verified_at``.
 
-    Two configs whose signatures differ describe different Doubao endpoints
-    or keys; in that case any old ``verified_at`` no longer applies.
+    Doubao: ``(provider, app_key, access_key, resource_id, endpoint)``.
+    Grok (KD-13): ``(provider, api_key, endpoint)`` only — language/options
+    are non-auth and must not invalidate verification.
     """
-    d = cfg.get("doubao") or {}
-    if not isinstance(d, Mapping):
-        d = {}
+    provider = cfg.get("provider")
+    if provider == "grok":
+        g = _section(cfg, "grok")
+        return (provider, g.get("api_key"), g.get("endpoint"))
+    d = _section(cfg, "doubao")
     return (
-        cfg.get("provider"),
+        provider,
         d.get("app_key"),
         d.get("access_key"),
         d.get("resource_id"),

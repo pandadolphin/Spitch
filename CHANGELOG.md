@@ -2,6 +2,46 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## Unreleased
+
+### Multi-provider Grok config + daemon wiring
+
+- `provider: "grok"` is now a complete, runnable config path: `is_complete`
+  accepts Grok when `api_key` + `endpoint` are set; daemon builds
+  `GrokSttClient` via `voice.factory.make_streaming_client` / factory.
+- Network warmup branches by provider: Doubao stays connect-only; Grok
+  calls `client.warmup()` (connect + wait `transcript.created` + close).
+- User-facing incomplete-config messages are provider-neutral
+  (“configure Spitch first — run spitch-config”).
+
+### Finalize wait wiring (Doubao behavior change — intentional)
+
+- **Controller** finalize race was defaulting to **2.0s** and was never
+  wired from config. It now uses `max(inject.final_wait_seconds, 5.0)`
+  (default **~30s**). Applies to **both** Doubao and Grok.
+- **Inject** queue wait is slightly longer than the controller wait by
+  construction: `inject_t = controller_t + release_linger_s + 1.0s slack`
+  so `on_final` cannot fire after inject already timed out (linger-safe
+  inequality). Stock defaults: controller 30.0s, inject 31.3s.
+- Non-finite `final_wait_seconds` / `release_linger_ms` (`nan`/`inf`) fall
+  back to safe clamps.
+
+### Cancel reliability (all providers)
+
+- `VoiceController.cancel()` now actively cancels the published asyncio
+  session task (including hang during connect / blocked recv).
+- Publish loop+task under lock as early as possible; if cancel already
+  fired before publish, the new task is cancelled immediately (C0).
+- At most one `on_final` per session on exception / finalize-timeout
+  paths (commit-once guard). Cancel path still delivers zero `on_final`.
+
+### Verification stamp hardening (KD-18)
+
+- Legacy unsigned `verified_at` (no `verified_signature`) is
+  **Doubao-only**. Grok always requires a matching `verified_signature`,
+  so an old Doubao stamp cannot authorize unprobed Grok credentials
+  after a manual provider switch.
+
 ## [0.7.1] — 2026-07-16
 
 ### 新增：说话时自动暂停媒体（MPRIS / playerctl）
