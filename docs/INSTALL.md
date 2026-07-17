@@ -30,6 +30,11 @@ sudo apt-get install -y libnotify-bin   # adds desktop notifications
 sudo apt-get install -y playerctl      # pause MPRIS media while talking
 ```
 
+`playerctl` is used when `audio.pause_media_on_talk` is true in config
+(default `true`): the daemon pauses Playing MPRIS players for the talk
+session and resumes them on release/cancel. Without `playerctl`, that
+feature is skipped with a log warning.
+
 PyGObject (for the GTK config dialog) is supplied by the system
 package `python3-gi` if you want a GUI; otherwise `spitch-config`
 falls back to a CLI prompt.
@@ -101,13 +106,14 @@ real WebSocket to the selected provider and verifies the handshake:
   **`transcript.done`** (silence audio is fine). Non-`wss://` endpoints
   are rejected.
 
-Only on success is the config saved (chmod 600) at
-`~/.config/spitch/config.json`, with `verified_at` +
-`verified_signature` stamped. Changing keys or switching providers
+Config is written to `~/.config/spitch/config.json` (chmod 600, atomic
+write). Probe **success** stamps `verified_at` + `verified_signature`.
+A complete form may still be **saved without** verification when the
+probe fails, is skipped (`--no-probe`), or a Grok endpoint is not
+`wss://` — in those cases any prior stamp is cleared. Incomplete forms
+are not saved. The daemon treats the voice path as incomplete until a
+matching probe succeeds. Changing keys or switching providers
 invalidates verification until you probe again.
-
-Controlled by `audio.pause_media_on_talk` in config (default `true`)
-when `playerctl` is installed.
 
 ### Secret handling
 
@@ -197,8 +203,8 @@ You should see a "Spitch ready" desktop notification. Test it:
   focused field.
 
 If you press a third key during the chord (e.g. Ctrl+Alt+T to launch
-  a terminal), the recording is automatically cancelled and the
-  shortcut passes through normally.
+a terminal), the recording is automatically cancelled and the
+shortcut passes through normally.
 
 ## 6. (Optional) auto-start at login
 
