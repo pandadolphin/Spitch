@@ -116,16 +116,8 @@ def run_cli(probe: bool = True) -> int:
             g.setdefault(key, default_val)
         cfg["grok"] = g
 
-        if not _grok_endpoint_scheme_ok(g.get("endpoint", "")):
-            sys.stderr.write(
-                "\nGrok endpoint must use wss:// — Bearer tokens must not "
-                "ride cleartext remote endpoints.\n"
-                "Saving config without verification — voice mode will stay "
-                "disabled until a probe succeeds with a wss:// endpoint.\n"
-            )
-            cfg = clear_verified(cfg)
-            save_config(cfg)
-            return 2
+        # Defer non-wss handling until after completeness check so an
+        # incomplete form cannot clobber a prior good verified config.
     else:
         d = dict(cfg.get("doubao") or {}) if isinstance(cfg.get("doubao"), dict) else {}
         d["app_key"] = _prompt("X-Api-App-Key", d.get("app_key", ""))
@@ -150,6 +142,24 @@ def run_cli(probe: bool = True) -> int:
     if not is_complete(cfg):
         sys.stderr.write("\nIncomplete config — keys are required. Aborting.\n")
         return 1
+
+    # Non-wss Grok endpoints: refuse probe/verify, but only persist when the
+    # rest of the form is complete (same as probe-fail path). Incomplete forms
+    # already aborted above without saving — preserves prior verified configs.
+    if provider == "grok":
+        g_ep = (cfg.get("grok") or {}).get("endpoint", "") if isinstance(
+            cfg.get("grok"), dict
+        ) else ""
+        if not _grok_endpoint_scheme_ok(str(g_ep or "")):
+            sys.stderr.write(
+                "\nGrok endpoint must use wss:// — Bearer tokens must not "
+                "ride cleartext remote endpoints.\n"
+                "Saving config without verification — voice mode will stay "
+                "disabled until a probe succeeds with a wss:// endpoint.\n"
+            )
+            cfg = clear_verified(cfg)
+            save_config(cfg)
+            return 2
 
     if probe:
         label = "Grok STT" if provider == "grok" else "Doubao"
@@ -313,14 +323,27 @@ def run_gtk() -> int:  # pragma: no cover - GUI is exercised manually
             "Spitch — Configure Grok STT" if is_grok else "Spitch — Configure Doubao"
         )
 
+    def _section_dict(raw: Any, fallback: dict | None = None) -> dict:
+        """KD-22: only copy dict/Mapping sections; non-mappings use fallback."""
+        from collections.abc import Mapping as AbcMapping
+
+        if isinstance(raw, AbcMapping) and not isinstance(raw, (str, bytes)):
+            return dict(raw)
+        return dict(fallback or {})
+
     def collect() -> dict[str, Any]:
         new_cfg = default_config()
         new_cfg.update(cfg)
         provider = selected_provider()
         new_cfg["provider"] = provider
         # Preserve both credential sections; update the active one.
-        new_cfg["doubao"] = dict(new_cfg.get("doubao") or {})
-        new_cfg["grok"] = dict(new_cfg.get("grok") or {})
+        # Mapping guards (KD-22): corrupted on-disk sections must not crash.
+        new_cfg["doubao"] = _section_dict(
+            new_cfg.get("doubao"), default_config()["doubao"]
+        )
+        new_cfg["grok"] = _section_dict(
+            new_cfg.get("grok"), default_config()["grok"]
+        )
         if provider == "doubao":
             new_cfg["doubao"] = {
                 "app_key": e_app.get_text().strip(),
@@ -331,19 +354,26 @@ def run_gtk() -> int:  # pragma: no cover - GUI is exercised manually
         else:
             new_cfg["grok"] = {
                 **dict(grok_defaults),
-                **dict(new_cfg.get("grok") or {}),
+                **_section_dict(new_cfg.get("grok"), grok_defaults),
                 "api_key": e_api_key.get_text().strip(),
                 "endpoint": e_g_endpoint.get_text().strip(),
                 "language": e_language.get_text().strip(),
             }
         try:
-            new_cfg["audio"] = dict(new_cfg.get("audio") or {})
+            new_cfg["audio"] = _section_dict(
+                new_cfg.get("audio"), default_config()["audio"]
+            )
             new_cfg["audio"]["sample_rate"] = int(
                 e_rate.get_text().strip() or "16000"
             )
         except ValueError:
+            new_cfg["audio"] = _section_dict(
+                new_cfg.get("audio"), default_config()["audio"]
+            )
             new_cfg["audio"]["sample_rate"] = 16000
-        new_cfg["hotkey"] = dict(new_cfg.get("hotkey") or {})
+        new_cfg["hotkey"] = _section_dict(
+            new_cfg.get("hotkey"), default_config()["hotkey"]
+        )
         new_cfg["hotkey"]["talk_key"] = e_talk.get_text().strip() or "Ctrl+Alt"
         return new_cfg
 

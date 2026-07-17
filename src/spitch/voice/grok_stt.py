@@ -276,7 +276,11 @@ class GrokTranscriptAccumulator:
 
 
 def _extract_http_status(exc: BaseException) -> int | None:
-    """Best-effort HTTP status across websockets generations."""
+    """Best-effort HTTP status across websockets generations.
+
+    Never treats ``OSError.errno`` / ``args[0]`` as an HTTP status — Linux
+    ``ECONNREFUSED`` is 111 and must not become "HTTP 111".
+    """
     # Legacy: InvalidStatusCode.status_code
     status = getattr(exc, "status_code", None)
     if isinstance(status, int):
@@ -288,6 +292,10 @@ def _extract_http_status(exc: BaseException) -> int | None:
             val = getattr(resp, attr, None)
             if isinstance(val, int):
                 return val
+    # OSError subclasses put errno in args[0] (e.g. ConnectionRefusedError(111, …)).
+    # That is not an HTTP status — skip args scan for OSError/network types.
+    if isinstance(exc, (OSError, TimeoutError, ConnectionError, asyncio.TimeoutError)):
+        return None
     # Some wrappers put status on the exception message / args
     for arg in getattr(exc, "args", ()) or ():
         if isinstance(arg, int) and 100 <= arg <= 599:
@@ -296,7 +304,14 @@ def _extract_http_status(exc: BaseException) -> int | None:
 
 
 def classify_ws_connect_error(exc: BaseException) -> tuple[str, str]:
-    """Return (category, user_message) for a connect/handshake failure (KD-20)."""
+    """Return (category, user_message) for a connect/handshake failure (KD-20).
+
+    Network/OS failures are classified before any status-code heuristics so
+    errno values (e.g. 111 = ECONNREFUSED) are never reported as HTTP status.
+    """
+    # Prefer network classification for OS/connect failures (KD-20).
+    if isinstance(exc, (OSError, TimeoutError, ConnectionError, asyncio.TimeoutError)):
+        return "network", "cannot reach endpoint"
     status = _extract_http_status(exc)
     if status == 401:
         return "credentials_rejected", "credentials rejected (HTTP 401)"
@@ -308,8 +323,6 @@ def classify_ws_connect_error(exc: BaseException) -> tuple[str, str]:
         return "service_unavailable", f"service error (HTTP {status})"
     if status is not None:
         return "handshake_failed", f"WebSocket handshake failed (HTTP {status})"
-    if isinstance(exc, (OSError, TimeoutError, ConnectionError, asyncio.TimeoutError)):
-        return "network", "cannot reach endpoint"
     return "handshake_failed", "WebSocket handshake failed"
 
 

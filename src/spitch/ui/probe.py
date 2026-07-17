@@ -137,25 +137,15 @@ def probe_credentials_for_config(
         return probe_credentials(creds, timeout=timeout)
 
     if provider == "grok":
-        # Validate endpoint early for a clear UI message even if factory
-        # would also raise; then build full credentials.
+        # Validate + build via _grok_creds with the same hatch flag so
+        # ws://127.0.0.1 mocks work when allow_insecure_localhost=True (KD-21).
         grok_section = cfg.get("grok")
         if grok_section is not None and not isinstance(grok_section, Mapping):
             return False, "Invalid Grok config: section must be a JSON object"
-        endpoint = ""
-        if isinstance(grok_section, Mapping):
-            endpoint = str(grok_section.get("endpoint") or "wss://api.x.ai/v1/stt")
-        else:
-            endpoint = "wss://api.x.ai/v1/stt"
         try:
-            validate_grok_endpoint(
-                endpoint,
-                allow_insecure_localhost=allow_insecure_localhost,
+            creds = _grok_creds(
+                cfg, allow_insecure_localhost=allow_insecure_localhost
             )
-        except GrokProtocolError as exc:
-            return False, f"Invalid Grok endpoint: {exc}"
-        try:
-            creds = _grok_creds(cfg)
         except GrokProtocolError as exc:
             return False, f"Invalid Grok endpoint: {exc}"
         except Exception as exc:

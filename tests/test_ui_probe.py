@@ -102,6 +102,42 @@ class ProbeCredentialsForConfigRoutingTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Invalid Grok config", msg)
 
+    def test_allow_insecure_localhost_reaches_probe_grok(self):
+        """ws://127.0.0.1 with hatch=True must not early-fail as invalid endpoint."""
+        cfg = default_config()
+        cfg["provider"] = "grok"
+        cfg["grok"]["api_key"] = "xai-test-fake"
+        cfg["grok"]["endpoint"] = "ws://127.0.0.1:8765/v1/stt"
+
+        with patch(
+            "spitch.ui.probe.probe_grok_credentials",
+            return_value=(True, "Grok STT connection succeeded — credentials accepted."),
+        ) as mock_probe:
+            ok, msg = probe_credentials_for_config(
+                cfg, allow_insecure_localhost=True
+            )
+        self.assertTrue(ok)
+        mock_probe.assert_called_once()
+        creds = mock_probe.call_args[0][0]
+        self.assertEqual(creds.endpoint, "ws://127.0.0.1:8765/v1/stt")
+        self.assertTrue(
+            mock_probe.call_args.kwargs.get("allow_insecure_localhost")
+            or mock_probe.call_args[1].get("allow_insecure_localhost")
+        )
+
+    def test_allow_insecure_localhost_false_still_rejects_localhost_ws(self):
+        cfg = default_config()
+        cfg["provider"] = "grok"
+        cfg["grok"]["api_key"] = "xai-test-fake"
+        cfg["grok"]["endpoint"] = "ws://127.0.0.1:8765/v1/stt"
+        with patch("spitch.ui.probe.probe_grok_credentials") as mock_probe:
+            ok, msg = probe_credentials_for_config(
+                cfg, allow_insecure_localhost=False
+            )
+        self.assertFalse(ok)
+        self.assertIn("Invalid Grok endpoint", msg)
+        mock_probe.assert_not_called()
+
 
 class ProbeGrokCredentialsMessagesTests(unittest.TestCase):
     def test_invalid_endpoint_before_connect(self):
@@ -158,6 +194,27 @@ class ProbeGrokCredentialsMessagesTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("401", msg)
         self.assertIn("credentials rejected", msg.lower())
+
+    def test_connection_refused_is_network_not_http_111(self):
+        """OSError errno 111 must not surface as 'HTTP 111' (KD-20)."""
+        creds = GrokSttCredentials(api_key="xai-test")
+
+        class _FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                raise ConnectionRefusedError(111, "Connection refused")
+
+            async def __aexit__(self, *a):
+                return None
+
+        with patch("spitch.ui.probe.GrokSttClient", _FakeClient):
+            ok, msg = probe_grok_credentials(creds)
+        self.assertFalse(ok)
+        self.assertIn("cannot reach endpoint", msg.lower())
+        self.assertNotIn("HTTP 111", msg)
+        self.assertNotIn("handshake failed", msg.lower())
 
     def test_success_message(self):
         creds = GrokSttCredentials(api_key="xai-test")
@@ -300,6 +357,50 @@ class RunCliDoesNotForceDoubaoTests(unittest.TestCase):
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0]["provider"], "grok")
         self.assertIsNone(saved[0].get("verified_at"))
+
+    def test_cli_incomplete_non_wss_does_not_save(self):
+        """Incomplete + non-wss must abort without clobbering prior config."""
+        from spitch.ui import config_dialog
+
+        saved: list[dict] = []
+        base = default_config()
+        base["provider"] = "doubao"
+        base["doubao"]["app_key"] = "good-ak"
+        base["doubao"]["access_key"] = "good-sk"
+        base["verified_at"] = "2026-01-01T00:00:00Z"
+        base["verified_signature"] = "stamp"
+
+        answers = iter(
+            [
+                "grok",
+                "",  # empty api_key → incomplete
+                "ws://example.com/v1/stt",
+                "",
+            ]
+        )
+
+        def fake_prompt(label, default="", *, secret=False):
+            try:
+                val = next(answers)
+            except StopIteration:
+                return default
+            return val if val != "" else default
+
+        def fake_save(cfg, path=None):
+            saved.append(dict(cfg))
+            return "/tmp/spitch-test-config.json"
+
+        with (
+            patch.object(config_dialog, "load_config", return_value=base),
+            patch.object(config_dialog, "_prompt", side_effect=fake_prompt),
+            patch.object(config_dialog, "save_config", side_effect=fake_save),
+            patch.object(config_dialog, "probe_credentials_for_config") as mock_probe,
+        ):
+            rc = config_dialog.run_cli(probe=True)
+
+        self.assertEqual(rc, 1)
+        mock_probe.assert_not_called()
+        self.assertEqual(saved, [], "must not save incomplete non-wss form")
 
     def test_cli_doubao_still_works(self):
         from spitch.ui import config_dialog

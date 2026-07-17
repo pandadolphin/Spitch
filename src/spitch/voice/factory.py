@@ -47,11 +47,22 @@ def _doubao_creds(cfg: Mapping[str, Any]) -> DoubaoCredentials:
     )
 
 
-def _grok_creds(cfg: Mapping[str, Any]) -> GrokSttCredentials:
+def _grok_creds(
+    cfg: Mapping[str, Any],
+    *,
+    allow_insecure_localhost: bool = False,
+) -> GrokSttCredentials:
+    """Build Grok credentials from config.
+
+    Production factory keeps ``allow_insecure_localhost=False`` (default).
+    Probe / local mocks may pass True so ``ws://127.0.0.1`` is accepted (KD-21).
+    """
     g = _require_mapping_section(cfg, "grok")
     endpoint = str(g.get("endpoint") or "wss://api.x.ai/v1/stt")
-    # Validate early so bad schemes fail at factory time, not mid-session.
-    validate_grok_endpoint(endpoint, allow_insecure_localhost=False)
+    # Validate early so bad schemes fail at factory/probe time, not mid-session.
+    validate_grok_endpoint(
+        endpoint, allow_insecure_localhost=allow_insecure_localhost
+    )
     endpointing = g.get("endpointing_ms")
     if endpointing is not None:
         try:

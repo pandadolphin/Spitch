@@ -354,6 +354,17 @@ class ParseAndEndpointTests(unittest.TestCase):
         cat, msg = classify_ws_connect_error(OSError("down"))
         self.assertEqual(cat, "network")
 
+        # errno 111 (ECONNREFUSED) must not become "HTTP 111"
+        cat, msg = classify_ws_connect_error(
+            ConnectionRefusedError(111, "Connection refused")
+        )
+        self.assertEqual(cat, "network")
+        self.assertEqual(msg, "cannot reach endpoint")
+        self.assertNotIn("111", msg)
+        self.assertIsNone(
+            _extract_http_status(ConnectionRefusedError(111, "Connection refused"))
+        )
+
     def test_classify_response_shaped_401(self):
         """Response-object status_code (websockets 14+ InvalidStatus shape)."""
 
