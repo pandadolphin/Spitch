@@ -331,6 +331,20 @@ class ParseAndEndpointTests(unittest.TestCase):
         self.assertEqual(cat, "credentials_rejected")
         self.assertIn("401", msg)
 
+        class E400(Exception):
+            status_code = 400
+
+        cat, msg = classify_ws_connect_error(E400())
+        self.assertEqual(cat, "invalid_configuration")
+        self.assertIn("400", msg)
+
+        class E429(Exception):
+            status_code = 429
+
+        cat, msg = classify_ws_connect_error(E429())
+        self.assertEqual(cat, "rate_limited")
+        self.assertIn("429", msg)
+
         class E500(Exception):
             status_code = 503
 
@@ -339,6 +353,17 @@ class ParseAndEndpointTests(unittest.TestCase):
 
         cat, msg = classify_ws_connect_error(OSError("down"))
         self.assertEqual(cat, "network")
+
+    def test_classify_response_shaped_401(self):
+        """Response-object status_code (websockets 14+ InvalidStatus shape)."""
+
+        class InvalidStatusLike(Exception):
+            def __init__(self):
+                self.response = MagicMock(status_code=401)
+
+        cat, msg = classify_ws_connect_error(InvalidStatusLike())
+        self.assertEqual(cat, "credentials_rejected")
+        self.assertIn("401", msg)
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +547,39 @@ class StreamLifecycleTests(unittest.TestCase):
         with self.assertRaises(GrokProtocolError) as cm:
             asyncio.run(_go())
         self.assertIn("transcript.done", str(cm.exception).lower())
+
+    def test_probe_fails_on_clean_close_without_done(self):
+        """Clean close after EOS without transcript.done is probe failure (KD-20)."""
+
+        class CloseAfterEosWS(FakeWS):
+            async def send(self, data):
+                await super().send(data)
+                # After audio.done, close the socket (no transcript.done).
+                if isinstance(data, str):
+                    try:
+                        if json.loads(data).get("type") == AUDIO_DONE_TYPE:
+                            self._closed = True
+                            self._scripted.clear()
+                    except Exception:
+                        pass
+
+            async def recv(self):
+                if self._closed and not self._scripted:
+                    raise ConnectionError("ws closed without transcript.done")
+                return await super().recv()
+
+        async def _go():
+            ws = CloseAfterEosWS([_created()], auto_created=False)
+            client = self._client_with_ws(ws)
+            await client.probe(timeout=2.0)
+
+        with self.assertRaises(GrokProtocolError) as cm:
+            asyncio.run(_go())
+        msg = str(cm.exception).lower()
+        self.assertTrue(
+            "incomplete" in msg or "closed" in msg,
+            f"expected incomplete/closed failure, got: {cm.exception!r}",
+        )
 
     def test_probe_success_on_done(self):
         async def _go():

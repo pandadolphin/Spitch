@@ -11,8 +11,8 @@ class TranscriptEvent:
     """One transcription update from a streaming STT provider.
 
     ``text`` is the session-facing accumulated text so far (suitable for
-    tray preedit / inject). ``is_final`` is True only for the provider's
-    session-terminal event (Doubao: definite family; Grok: ``transcript.done``).
+    tray preedit / inject). ``is_final`` is the provider finality flag
+    (Doubao: utterance ``definite``; Grok: session ``transcript.done`` only).
     ``raw`` is the provider-native event/payload dict — Grok events must
     never carry Doubao-shaped ``result.utterances``.
     """

@@ -36,9 +36,8 @@ def _header_kwarg_name(connect_fn: Any) -> str:
     if "extra_headers" in params:
         return "extra_headers"
     # Fallback: some wrappers accept **kwargs only — prefer the modern name.
-    for name in ("additional_headers", "extra_headers"):
-        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-            return "additional_headers"
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return "additional_headers"
     raise RuntimeError(
         "websockets.connect accepts neither additional_headers nor extra_headers; "
         "upgrade or pin a supported websockets version (12–15)"

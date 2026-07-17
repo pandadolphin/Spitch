@@ -183,16 +183,12 @@ def _needs_space(left: str, right: str) -> bool:
     # Latin alnum–alnum
     if left[-1].isalnum() and left[-1].isascii() and r0.isalnum() and r0.isascii():
         return True
-    # Punctuation then Latin
+    # Punctuation then Latin (covers "Hello."+"World", "yes,"+"please")
     if left[-1] in _PUNCT_END and r0.isalnum() and r0.isascii():
         return True
-    # Closing quote then Latin
+    # Closing quote then Latin (covers splits after quoted clauses, e.g. Hello." )
     if left[-1] in _CLOSING_QUOTE and r0.isalnum() and r0.isascii():
         return True
-    # Optional: punctuation already followed by quote, e.g. Hello."
-    if len(left) >= 2 and left[-1] in _CLOSING_QUOTE and left[-2] in _PUNCT_END:
-        if r0.isalnum() and r0.isascii():
-            return True
     return False
 
 
@@ -327,6 +323,22 @@ def _assert_no_doubao_utterances(raw: Mapping[str, Any]) -> None:
         )
 
 
+def _is_ws_close_error(exc: BaseException) -> bool:
+    """True for normal connection-close failures after EOS (not protocol bugs)."""
+    if isinstance(exc, (ConnectionError, EOFError, TimeoutError, OSError)):
+        return True
+    # websockets.ConnectionClosed* (and similar) across versions
+    name = type(exc).__name__
+    if "ConnectionClosed" in name or name in ("ConnectionClosedOK", "ConnectionClosedError"):
+        return True
+    # Module-path check without hard import
+    mod = getattr(type(exc), "__module__", "") or ""
+    if "websockets" in mod and "ConnectionClosed" in name:
+        return True
+    return False
+
+
+
 class GrokSttClient:
     """StreamingClient for xAI Grok STT WebSocket.
 
@@ -415,8 +427,16 @@ class GrokSttClient:
             return
         try:
             await asyncio.wait_for(ws.close(), timeout=CLOSE_TIMEOUT_S)
-        except (asyncio.TimeoutError, Exception):
+        except asyncio.CancelledError:
+            # Cancel during close: still abort the transport, then re-raise.
+            logger.debug("ws close cancelled; aborting transport")
+            self._abort_transport(ws)
+            raise
+        except asyncio.TimeoutError:
             logger.warning("ws close timed out; aborting transport")
+            self._abort_transport(ws)
+        except Exception as exc:
+            logger.warning("ws close failed (%s); aborting transport", exc)
             self._abort_transport(ws)
 
     @staticmethod
@@ -583,10 +603,25 @@ class GrokSttClient:
                 if recv_task is not None and recv_task in done:
                     try:
                         raw = recv_task.result()
-                    except Exception:
-                        # WS closed after sender finished cleanly → end stream
+                    except Exception as exc:
+                        # After clean EOS: known close types end the stream
+                        # without a fabricated timeout (controller owns budget).
+                        # Unexpected post-EOS errors are re-raised for diagnosis.
                         if sender_done_ok:
-                            return
+                            if _is_ws_close_error(exc):
+                                logger.info(
+                                    "stream ended after EOS without transcript.done "
+                                    "(%s: %s)",
+                                    type(exc).__name__,
+                                    exc,
+                                )
+                                return
+                            logger.warning(
+                                "unexpected recv error after EOS: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
+                            raise
                         raise
                     recv_task = None
                     obj = _parse_server_message(raw)
@@ -657,11 +692,14 @@ class GrokSttClient:
             # Propagate iterator / send failures to the stream consumer
             raise
 
-        # EOS — best-effort only if socket still open
-        try:
-            if self._creds.send_finalize_on_eos:
+        # EOS — best-effort; send finalize and audio.done independently so a
+        # finalize failure does not skip audio.done while the socket is open.
+        if self._creds.send_finalize_on_eos:
+            try:
                 await self._ws.send(json.dumps({"type": FINALIZE_TYPE}))
+            except Exception:
+                pass
+        try:
             await self._ws.send(json.dumps({"type": AUDIO_DONE_TYPE}))
         except Exception:
-            # Socket already closed — skip EOS
             pass
