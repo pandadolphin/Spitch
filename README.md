@@ -103,13 +103,13 @@ spitch-daemon &      # 按住 Ctrl+Alt 说话，松开后自动粘贴
 | `audio.sample_rate` | 麦克风采样率 | 16000 |
 | `audio.prebuffer_ms` | 常驻麦克风的环形预缓冲长度（ms）。修复"按下后说的前半截被吃掉"——按下时回放这段缓冲。设为 0 = 关闭常驻麦克风，按下才开 | `500` |
 | `audio.pause_media_on_talk` | 按住说话键时用 `playerctl` 暂停正在播放的 MPRIS 媒体，松手后恢复。需安装 `playerctl` | `true` |
-| `hotkey.talk_key` | 按住说话的修饰键组合 | `Ctrl+Alt` |
+| `hotkey.talk_key` | 按住说话的修饰键。默认双键组合；`RightAlt` / `RightCtrl` 可单用，逗号表示「或」 | `Ctrl+Alt` |
 | `inject.paste_keystroke` | 粘贴用的合成快捷键 | `Ctrl+Shift+V` |
 | `inject.restore_clipboard_delay_ms` | 粘贴后等多久才把剪贴板还原（ms） | `800` |
 | `inject.final_wait_seconds` | 松手进入 FINALIZING 后，等 server final 的 **stream budget**（秒）。controller 用 `max(该值, 5)`；inject 队列等待会略长（+ linger + slack） | `30.0` |
 | `history.capacity` | 最近转写历史保留条数 | `50` |
 
-修改后重启 daemon 生效。
+修改后保存即可：运行中的 daemon 会 `reload_config`（录音中会等松开再切）。控制台仍保留 **重启 daemon** 给卡死的进程用。
 
 ## 控制台 / 历史 / 重粘
 
@@ -118,13 +118,14 @@ v0.5 起 daemon 维护最近 50 条转写历史，提供三种使用方式：
 - **托盘菜单**：右键托盘图标 → "打开控制台"。三 tab 窗口：
   - 历史：复制 / 重粘 / 删除任何一条
   - 日志：实时 tail `~/.local/state/spitch/daemon.log`
-  - 设置：常用配置项的图形界面（不含凭据，凭据仍走 spitch-config）
+  - 设置：常用配置项的图形界面（不含凭据，凭据仍走 spitch-config）；保存后热加载
 - **`spitch-cli`**：命令行同样能管历史
   ```bash
   spitch-cli list           # 查看历史
   spitch-cli repaste        # 重粘最近一次
   spitch-cli repaste --index 3  # 重粘第 3 条
   spitch-cli clear          # 清空
+  spitch-cli reload         # 让运行中的 daemon 重读 config.json
   ```
 - **绑定到系统快捷键**：把 `spitch-cli repaste` 绑到 GNOME Settings → 键盘 → 自定义快捷键（推荐 `Super+Z`）。任何时候上次粘漏了 / 想再发一遍，一个键补救。
 
@@ -142,7 +143,7 @@ v0.5 起 daemon 维护最近 50 条转写历史，提供三种使用方式：
 Spitch 会在粘贴前保存原剪贴板，约 0.3 秒后还原。如果你的目标应用消费粘贴较慢，原剪贴板可能在被消费前覆盖回去；增大 `src/spitch/inject/text_injector.py` 里的 sleep。
 
 **怎么换热键？**
-`spitch-config` 的 *Push-to-talk key* 字段，或直接编辑 `config.json` 的 `hotkey.talk_key`。**目前只支持修饰键双键组合**（`Ctrl/Alt/Shift/Super` 任选两个），不支持单键 / 字母键作为长按热键。
+`spitch-config` 的 *Push-to-talk key* 字段，或直接编辑 `config.json` 的 `hotkey.talk_key`。支持修饰键双键组合（`Ctrl/Alt/Shift/Super` 任选两个），以及单侧单键 `RightAlt` / `RightCtrl`。多个热键用逗号或 `or`：`RightAlt, RightCtrl` 表示按住其中任意一个即可。左 Alt / 左 Ctrl 仍走系统快捷键。不支持字母键。改完重启 daemon。
 
 **第三键取消是什么意思？**
 按住 `Ctrl+Alt` 期间如果再按字母（比如要 `Ctrl+Alt+T` 开终端），录音自动作废、热键正常作为系统快捷键生效。让你不用为了用 Spitch 而避开常见系统快捷键。

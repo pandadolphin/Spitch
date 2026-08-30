@@ -108,6 +108,50 @@ class CmdSockTests(unittest.TestCase):
                 resp = call("ping", path=p)
                 self.assertTrue(resp["ok"])
 
+    def test_stop_returns_with_active_subscribe(self):
+        """stop() must not hang when a long-lived subscribe is open.
+
+        Regression guard for SIGTERM paths that call CmdServer.stop from
+        the daemon main thread — a blocked shutdown() leaves systemd in
+        stop-sigterm.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "cmd.sock"
+
+            def _stream(req, send, wait_close):
+                wait_close()
+
+            srv = CmdServer(
+                handlers={"ping": lambda r: {}},
+                stream_handlers={"subscribe": _stream},
+                path=p,
+            )
+            srv.start()
+            deadline = time.time() + 1.0
+            while time.time() < deadline and not p.exists():
+                time.sleep(0.01)
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(2.0)
+            try:
+                client.connect(str(p))
+                client.sendall(
+                    b'{"op":"subscribe","filter":"salmon"}\n'
+                )
+                ack = client.recv(4096)
+                self.assertIn(b"subscribed", ack)
+                t0 = time.time()
+                srv.stop(timeout=2.0)
+                elapsed = time.time() - t0
+                self.assertLess(
+                    elapsed, 3.0,
+                    f"CmdServer.stop hung for {elapsed:.2f}s with open subscribe",
+                )
+            finally:
+                try:
+                    client.close()
+                except OSError:
+                    pass
+
 
 class DefaultPathTests(unittest.TestCase):
     def test_xdg_runtime_dir_preferred(self):

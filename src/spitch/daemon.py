@@ -16,6 +16,7 @@ release-friendly choice the project switched to in v0.2.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import shutil
 import signal
@@ -23,7 +24,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from .cmdsock import CmdServer, default_socket_path
 from .config import (
@@ -37,7 +38,13 @@ from .config import (
 )
 from .eventbus import EventBus
 from .history import HistoryEntry, HistoryRing, default_history_path
-from .hotkey import HotkeyListener, parse_combo
+from .hotkey import (
+    HotkeyListener,
+    combo_allowed_for_talk,
+    format_talk_keys,
+    parse_combo,
+    parse_talk_keys,
+)
 from .inject import inject_text
 from .media_pause import MediaPauser
 from .tray import try_create as try_create_indicator
@@ -51,6 +58,12 @@ from .voice import (
 )
 
 log = logging.getLogger("spitch.daemon")
+
+# If clean shutdown (Gtk.main_quit + _shutdown) has not finished within
+# this many seconds of SIGTERM/SIGINT/Quit, force-exit. Prevents a
+# wedged ALSA close, nested Gtk.main level, or cmdsock.shutdown wait
+# from stranding the systemd unit in stop-sigterm until TimeoutStopSec.
+_SHUTDOWN_HARD_EXIT_S = 5.0
 
 
 class _WebsocketsAttributeErrorFilter(logging.Filter):
@@ -130,6 +143,38 @@ def _notify(summary: str, body: str = "") -> None:
         pass
 
 
+def validate_runtime_config(cfg: Mapping[str, Any]) -> str | None:
+    """Return a user-facing error if ``cfg`` cannot drive the daemon.
+
+    ``None`` means complete, verified, and the talk hotkey is usable.
+    Used at process start and by ``reload_config`` so a bad save cannot
+    clobber a working in-memory snapshot.
+    """
+    if not is_complete(cfg):
+        return "incomplete config — run spitch-config"
+    if not is_verified(cfg):
+        return (
+            "not verified — run spitch-config and click "
+            "'Test connection' before switching provider"
+        )
+    talk_spec = _section(cfg, "hotkey").get("talk_key", "Ctrl+Alt")
+    combos = parse_talk_keys(str(talk_spec) if talk_spec else "")
+    if not combos:
+        return (
+            "invalid talk_key — set hotkey.talk_key to a modifier-pair "
+            "like 'Ctrl+Alt', a sided single like 'RightAlt', or several "
+            "separated by comma ('RightAlt, RightCtrl')"
+        )
+    bad = [c for c in combos if not combo_allowed_for_talk(c)]
+    if bad:
+        return (
+            "hotkey.talk_key must combine two modifiers, "
+            "or be RightAlt / RightCtrl "
+            f"(got {format_talk_keys(bad)!r})"
+        )
+    return None
+
+
 class SpitchDaemon:
     def __init__(self, cfg: dict):
         self._cfg = cfg
@@ -197,6 +242,9 @@ class SpitchDaemon:
         self._salmon_session_started_at: float = 0.0
         # Watchdog Timer for the stuck-recording guard in salmon mode.
         self._salmon_watchdog: Optional[threading.Timer] = None
+        # Set once on Quit / SIGTERM / SIGINT so re-entrant signals are
+        # ignored and the hard-exit watchdog arms only once.
+        self._exit_requested = False
         # Debounce Timer: super is a single modifier so brief accidental
         # taps (reaching for keyboard shortcuts, jostling the key) would
         # otherwise kick off a voice session. Hold for ≥SALMON_DEBOUNCE
@@ -214,9 +262,16 @@ class SpitchDaemon:
         except (TypeError, ValueError):
             pause_media = True
         self._media = MediaPauser(enabled=pause_media)
+        self._reload_lock = threading.Lock()
+        self._pending_reload = False
+        self._reloading = False
+        self._warmup_kick = threading.Event()
 
-    def _build_voice(self) -> VoiceController:
-        audio_cfg = _section(self._cfg, "audio")
+    def _construct_voice(
+        self, cfg: Mapping[str, Any]
+    ) -> tuple[AudioCapture, VoiceController, float]:
+        """Build audio + controller for ``cfg`` without assigning ``self``."""
+        audio_cfg = _section(cfg, "audio")
         try:
             sample_rate = int(_finite_float(audio_cfg.get("sample_rate", 16000), 16000))
         except (TypeError, ValueError):
@@ -227,27 +282,193 @@ class SpitchDaemon:
             prebuffer_ms = int(_finite_float(audio_cfg.get("prebuffer_ms", 500), 500))
         except (TypeError, ValueError):
             prebuffer_ms = 500
-        self._audio = AudioCapture(
+        audio = AudioCapture(
             AudioConfig(sample_rate=sample_rate, prebuffer_ms=prebuffer_ms)
         )
-        controller_t, inject_t = _finalize_deadlines(self._cfg)
-        self._finalize_timeout = inject_t  # pending.get(timeout=...) in inject
+        controller_t, inject_t = _finalize_deadlines(cfg)
         log.info(
             "finalize deadlines: controller=%.1fs inject=%.1fs (provider=%s)",
             controller_t,
             inject_t,
-            self._cfg.get("provider") or "doubao",
+            cfg.get("provider") or "doubao",
         )
-        factory = make_client_factory(self._cfg, sample_rate=sample_rate)
-        return VoiceController(
+        factory = make_client_factory(cfg, sample_rate=sample_rate)
+        voice = VoiceController(
             client_factory=factory,
-            audio=self._audio,
+            audio=audio,
             on_partial=self._on_partial,
             on_final=self._on_final,
             on_error=self._on_error,
             on_state=self._on_state,
-            finalize_timeout=controller_t,  # KD-12: was defaulting to 2.0
+            finalize_timeout=controller_t,
         )
+        return audio, voice, inject_t
+
+    def _build_voice(self) -> VoiceController:
+        audio, voice, inject_t = self._construct_voice(self._cfg)
+        self._audio = audio
+        self._finalize_timeout = inject_t
+        return voice
+
+    def _stop_hotkeys(self) -> None:
+        for attr in ("_listener", "_salmon_listener"):
+            lis = getattr(self, attr)
+            setattr(self, attr, None)
+            if lis is None:
+                continue
+            stop = getattr(lis, "stop", None)
+            if not callable(stop):
+                continue
+            try:
+                stop()
+            except Exception:
+                log.exception("stop hotkey listener failed")
+
+    def _start_hotkeys(self, cfg: Mapping[str, Any]) -> None:
+        talk_spec = _section(cfg, "hotkey").get("talk_key", "Ctrl+Alt")
+        combos = parse_talk_keys(str(talk_spec) if talk_spec else "")
+        allow_single = any(len(c) == 1 for c in combos)
+        self._listener = HotkeyListener(
+            alternatives=combos,
+            on_press=self._on_press,
+            on_release=self._on_release,
+            on_cancel=self._on_cancel,
+            allow_single_mod=allow_single,
+        )
+        self._listener.start()
+        salmon_spec = _section(cfg, "hotkey").get("salmon_key", "")
+        salmon_combo = parse_combo(salmon_spec) if salmon_spec else []
+        self._salmon_listener = None
+        if salmon_combo:
+            try:
+                self._salmon_listener = HotkeyListener(
+                    salmon_combo,
+                    on_press=self._on_salmon_press,
+                    on_release=self._on_salmon_release,
+                    on_cancel=self._on_salmon_cancel,
+                    allow_single_mod=True,
+                )
+                self._salmon_listener.start()
+                log.info(
+                    "salmon-mode hotkey: hold %s (events on cmdsock subscribe)",
+                    "+".join(salmon_combo),
+                )
+            except (RuntimeError, ValueError) as exc:
+                log.warning("could not start salmon hotkey listener: %s", exc)
+                self._salmon_listener = None
+
+    def _session_busy(self) -> bool:
+        voice = self._voice
+        if voice is not None and voice.state in (State.RECORDING, State.FINALIZING):
+            return True
+        if self._press_accepted:
+            return True
+        if self._linger_timer is not None:
+            return True
+        return False
+
+    def reload_config(self) -> dict:
+        """Re-read ``config.json`` and rebuild voice / hotkeys / audio.
+
+        Rejects incomplete or unverified configs without touching the
+        running snapshot (so a Grok save without probe does not disable
+        a working Doubao session). If a talk session is in flight, the
+        reload is deferred until IDLE.
+        """
+        with self._reload_lock:
+            try:
+                new_cfg = load_config()
+            except Exception as exc:
+                return {"ok": False, "error": f"cannot read config: {exc}"}
+            err = validate_runtime_config(new_cfg)
+            if err:
+                log.warning("reload_config rejected: %s", err)
+                return {"ok": False, "error": err}
+            if self._session_busy() or self._reloading:
+                self._pending_reload = True
+                provider = new_cfg.get("provider") or "doubao"
+                log.info(
+                    "reload_config deferred until idle (provider=%s)", provider
+                )
+                return {
+                    "ok": True,
+                    "applied": False,
+                    "deferred": True,
+                    "provider": provider,
+                    "message": "session in progress — will apply when idle",
+                }
+            return self._apply_config(new_cfg)
+
+    def _apply_config(self, new_cfg: dict) -> dict:
+        """Caller holds ``_reload_lock``. ``new_cfg`` is already validated."""
+        old_provider = (self._cfg.get("provider") or "doubao") if self._cfg else "doubao"
+        new_provider = new_cfg.get("provider") or "doubao"
+        self._reloading = True
+        self._pending_reload = False
+        old_audio = self._audio
+        old_voice = self._voice
+        self._stop_hotkeys()
+        try:
+            audio, voice, inject_t = self._construct_voice(new_cfg)
+            self._cfg = new_cfg
+            self._audio = audio
+            self._voice = voice
+            self._finalize_timeout = inject_t
+            try:
+                self._media.enabled = bool(
+                    _section(new_cfg, "audio").get("pause_media_on_talk", True)
+                )
+            except (TypeError, ValueError):
+                self._media.enabled = True
+            self._start_hotkeys(new_cfg)
+            if self._audio is not None:
+                try:
+                    backend = self._audio.open()
+                    if backend:
+                        log.info("audio backend warmed up: %s", backend)
+                except Exception as exc:
+                    log.warning(
+                        "reload: could not pre-open mic (%s) — will open on press",
+                        exc,
+                    )
+        except Exception as exc:
+            log.exception("reload_config apply failed")
+            try:
+                self._start_hotkeys(self._cfg)
+            except Exception:
+                log.exception("reload: failed to restore hotkeys")
+            return {"ok": False, "error": f"apply failed: {exc}"}
+        finally:
+            self._reloading = False
+        if old_voice is not None and old_voice is not self._voice:
+            try:
+                if old_voice.state != State.IDLE:
+                    old_voice.cancel()
+            except Exception:
+                log.exception("reload: cancel old voice failed")
+        if old_audio is not None and old_audio is not self._audio:
+            try:
+                old_audio.close()
+            except Exception:
+                log.exception("reload: old audio close failed")
+        self._warmup_kick.set()
+        log.info("config reloaded: provider %s → %s", old_provider, new_provider)
+        if old_provider != new_provider:
+            _notify("Spitch", f"provider: {new_provider}")
+        talk_spec = _section(new_cfg, "hotkey").get("talk_key", "Ctrl+Alt")
+        return {
+            "ok": True,
+            "applied": True,
+            "deferred": False,
+            "provider": new_provider,
+            "talk_key": talk_spec,
+        }
+
+    def _run_deferred_reload(self) -> None:
+        try:
+            self.reload_config()
+        except Exception:
+            log.exception("deferred reload_config failed")
 
     # -- voice callbacks ----------------------------------------------
 
@@ -331,6 +552,22 @@ class SpitchDaemon:
                 self._media.resume()
             except Exception:
                 log.exception("media resume on state=%s failed", s)
+            # Grok (and empty Doubao) can end the session without
+            # on_final — _commit_final refuses empty text. Unblock the
+            # inject thread so it does not sit for finalize_timeout
+            # (~31s) after the controller is already idle.
+            q = self._pending_final
+            if q is not None:
+                try:
+                    q.put_nowait("")
+                except queue.Full:
+                    pass
+            if s == State.IDLE and self._pending_reload:
+                threading.Thread(
+                    target=self._run_deferred_reload,
+                    name="spitch-reload",
+                    daemon=True,
+                ).start()
         if self._indicator is not None:
             # Tray icon + label provide all the state feedback the
             # user needs; suppress the desktop notification popups
@@ -381,6 +618,9 @@ class SpitchDaemon:
                 log.exception("flushing pending linger release failed")
 
     def _on_press(self) -> None:
+        if self._reloading:
+            log.info("press: ignored (config reload in progress)")
+            return
         if self._voice is None:
             _notify("Spitch", "configure Spitch first — run spitch-config")
             return
@@ -698,7 +938,9 @@ class SpitchDaemon:
             log.warning("no final transcript within %.1fs", self._finalize_timeout)
             return
         if not text:
-            log.warning("inject: empty text from queue, aborting")
+            log.info("inject: empty transcript, skip")
+            if (self._cfg.get("provider") or "") == "grok":
+                _notify("Spitch — Grok 没有听出内容")
             return
         log.info(
             "inject: prep text len=%d preview=%r",
@@ -760,7 +1002,13 @@ class SpitchDaemon:
 
     def _cmd_ping(self, _req: dict) -> dict:
         from . import __version__
-        return {"version": __version__}
+        return {
+            "version": __version__,
+            "provider": self._cfg.get("provider") or "doubao",
+        }
+
+    def _cmd_reload_config(self, _req: dict) -> dict:
+        return self.reload_config()
 
     def _cmd_list_history(self, _req: dict) -> dict:
         return {"entries": [e.to_dict() for e in self._history.all()]}
@@ -825,77 +1073,16 @@ class SpitchDaemon:
     # -- main loop ----------------------------------------------------
 
     def run(self) -> int:
-        if not is_complete(self._cfg):
-            print(
-                "spitch: configure Spitch first — run spitch-config",
-                file=sys.stderr,
-            )
-            return 2
-        if not is_verified(self._cfg):
-            print(
-                "spitch: not verified — run spitch-config and click "
-                "'Test connection' before launching the daemon",
-                file=sys.stderr,
-            )
+        err = validate_runtime_config(self._cfg)
+        if err:
+            print(f"spitch: {err}", file=sys.stderr)
             return 2
         self._voice = self._build_voice()
-        combo = parse_combo(
-            _section(self._cfg, "hotkey").get("talk_key", "Ctrl+Alt")
-        )
-        if not combo:
-            print(
-                "spitch: invalid talk_key — set hotkey.talk_key to a "
-                "modifier-pair like 'Ctrl+Alt'",
-                file=sys.stderr,
-            )
-            return 2
-        if len(combo) < 2:
-            # Single-modifier hold is unusable: Ctrl/Alt/Shift/Super get
-            # pressed dozens of times per minute for system shortcuts
-            # and would each trigger a recording. Reject with a
-            # specific, fixable message rather than letting the daemon
-            # come up and behave erratically.
-            print(
-                f"spitch: hotkey.talk_key must combine two modifiers "
-                f"(got just '{combo[0]}'). Try 'Ctrl+Alt' or "
-                "'Ctrl+Shift'.",
-                file=sys.stderr,
-            )
-            return 2
-        self._listener = HotkeyListener(
-            combo,
-            on_press=self._on_press,
-            on_release=self._on_release,
-            on_cancel=self._on_cancel,
-        )
         try:
-            self._listener.start()
+            self._start_hotkeys(self._cfg)
         except RuntimeError as exc:
             print(f"spitch: {exc}", file=sys.stderr)
             return 3
-        # v0.6: optional second hotkey routes the transcript to the
-        # salmon event bus instead of pasting. Default is "Super"
-        # (single-modifier holds are opted in via allow_single_mod).
-        # Setting hotkey.salmon_key to "" disables salmon mode.
-        salmon_spec = _section(self._cfg, "hotkey").get("salmon_key", "")
-        salmon_combo = parse_combo(salmon_spec) if salmon_spec else []
-        if salmon_combo:
-            try:
-                self._salmon_listener = HotkeyListener(
-                    salmon_combo,
-                    on_press=self._on_salmon_press,
-                    on_release=self._on_salmon_release,
-                    on_cancel=self._on_salmon_cancel,
-                    allow_single_mod=True,
-                )
-                self._salmon_listener.start()
-                log.info(
-                    "salmon-mode hotkey: hold %s (events on cmdsock subscribe)",
-                    "+".join(salmon_combo),
-                )
-            except (RuntimeError, ValueError) as exc:
-                log.warning("could not start salmon hotkey listener: %s", exc)
-                self._salmon_listener = None
         # Pre-open the mic so the very first press doesn't pay the
         # 50–500 ms backend warm-up latency that otherwise eats the
         # head of the user's first utterance. With prebuffer_ms == 0
@@ -936,6 +1123,7 @@ class SpitchDaemon:
                     "delete_history": self._cmd_delete_history,  # alias
                     "clear":          self._cmd_clear_history,
                     "clear_history":  self._cmd_clear_history,  # alias
+                    "reload_config":  self._cmd_reload_config,
                 },
                 stream_handlers={
                     "subscribe":      self._cmd_subscribe,
@@ -947,11 +1135,12 @@ class SpitchDaemon:
             log.warning("could not start cmd socket (%s) — console / "
                         "spitch-cli won't be able to talk to daemon", exc)
             self._cmdserver = None
-        log.info("Spitch daemon ready — hold %s to talk", "+".join(combo))
-        _notify(
-            "Spitch ready",
-            "Hold " + "+".join(c.title() for c in combo) + " to talk",
+        talk_spec = _section(self._cfg, "hotkey").get("talk_key", "Ctrl+Alt")
+        talk_label = format_talk_keys(
+            parse_talk_keys(str(talk_spec) if talk_spec else "")
         )
+        log.info("Spitch daemon ready — hold %s to talk", talk_label)
+        _notify("Spitch ready", "Hold " + talk_label + " to talk")
 
         # Try to put up a tray indicator. If the AppIndicator typelib
         # is missing — or if it's present but Gtk import fails — we
@@ -967,21 +1156,30 @@ class SpitchDaemon:
             from gi.repository import Gtk as _Gtk, GLib as _GLib
             Gtk, GLib = _Gtk, _GLib
             self._indicator = try_create_indicator(
-                on_quit=lambda: GLib.idle_add(Gtk.main_quit),
+                on_quit=lambda: self._request_exit(Gtk=Gtk, GLib=GLib),
             )
         except (ValueError, ImportError):
             Gtk = GLib = None
 
         if Gtk is not None and self._indicator is not None:
             def _quit(*_):
-                Gtk.main_quit()
-                return GLib.SOURCE_REMOVE
+                self._request_exit(Gtk=Gtk, GLib=GLib)
+                # Keep the GLib source: a nested Gtk.main level (e.g.
+                # AboutDialog.run) only consumes one main_quit per
+                # signal; subsequent SIGTERMs must still be handled.
+                return True
             try:
                 GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, _quit)
                 GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, _quit)
             except Exception:
-                signal.signal(signal.SIGINT, lambda *_: Gtk.main_quit())
-                signal.signal(signal.SIGTERM, lambda *_: Gtk.main_quit())
+                signal.signal(
+                    signal.SIGINT,
+                    lambda *_: self._request_exit(Gtk=Gtk, GLib=GLib),
+                )
+                signal.signal(
+                    signal.SIGTERM,
+                    lambda *_: self._request_exit(Gtk=Gtk, GLib=GLib),
+                )
             try:
                 Gtk.main()
             finally:
@@ -989,13 +1187,85 @@ class SpitchDaemon:
             return 0
 
         stop = threading.Event()
-        signal.signal(signal.SIGINT, lambda *_: stop.set())
-        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+        signal.signal(signal.SIGINT, lambda *_: self._request_exit(stop_event=stop))
+        signal.signal(signal.SIGTERM, lambda *_: self._request_exit(stop_event=stop))
         try:
             stop.wait()
         finally:
             self._shutdown()
         return 0
+
+    def _request_exit(
+        self,
+        *,
+        Gtk=None,
+        GLib=None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> None:
+        """Begin process exit from Quit menu, SIGTERM, or SIGINT.
+
+        Arms a hard ``os._exit`` watchdog so a wedged clean path (nested
+        Gtk main loop, blocking ALSA close, cmdsock.shutdown wait) cannot
+        leave the systemd unit stuck in ``stop-sigterm``.
+        """
+        if self._exit_requested:
+            # Re-entrant signal: keep draining nested Gtk loops.
+            if Gtk is not None and GLib is not None:
+                GLib.idle_add(self._quit_gtk_levels, Gtk)
+            if stop_event is not None:
+                stop_event.set()
+            return
+        self._exit_requested = True
+        log.info("shutdown requested")
+
+        def _hard_exit() -> None:
+            log.error(
+                "shutdown watchdog: clean exit did not finish within "
+                "%.1fs — forcing os._exit(0)",
+                _SHUTDOWN_HARD_EXIT_S,
+            )
+            os._exit(0)
+
+        watchdog = threading.Timer(_SHUTDOWN_HARD_EXIT_S, _hard_exit)
+        watchdog.daemon = True
+        watchdog.start()
+
+        # Abort any in-flight ASR session so worker threads wind down
+        # instead of holding network/audio resources across stop.
+        try:
+            if self._voice is not None:
+                self._voice.cancel()
+        except Exception:
+            log.exception("voice cancel during shutdown failed")
+        self._cancel_pending_linger()
+        self._cancel_salmon_watchdog()
+        self._cancel_salmon_debounce()
+
+        if stop_event is not None:
+            stop_event.set()
+        if Gtk is not None and GLib is not None:
+            # Schedule on the GLib loop: signal handlers must not call
+            # into Gtk directly. Drain every nested main level.
+            GLib.idle_add(self._quit_gtk_levels, Gtk)
+
+    @staticmethod
+    def _quit_gtk_levels(Gtk) -> bool:
+        """Quit one Gtk.main level per idle turn until fully drained.
+
+        Returns True to reschedule while levels remain (AboutDialog.run
+        and similar nested loops only pop one level per main_quit).
+        """
+        try:
+            level = Gtk.main_level()
+        except Exception:
+            return False
+        if level <= 0:
+            return False
+        try:
+            Gtk.main_quit()
+        except Exception:
+            return False
+        return True
 
     def _network_warmup_loop(self) -> None:
         """Pre-establish (then close) an ASR WebSocket on a timer.
@@ -1014,37 +1284,39 @@ class SpitchDaemon:
             then closes; connect-only is insufficient for Grok ASR
             readiness.
 
-        Interval remains 240 s.
+        Interval remains 240 s. ``reload_config`` kicks the wait so a
+        provider switch warms the new endpoint immediately.
         """
         import asyncio
 
-        audio_cfg = _section(self._cfg, "audio")
-        try:
-            sample_rate = int(
-                _finite_float(audio_cfg.get("sample_rate", 16000), 16000)
-            )
-        except (TypeError, ValueError):
-            sample_rate = 16000
-        if sample_rate <= 0:
-            sample_rate = 16000
-        provider = self._cfg.get("provider") or "doubao"
-
-        async def _one_warmup() -> float:
-            client = make_streaming_client(self._cfg, sample_rate=sample_rate)
-            if provider == "grok":
-                # GrokSttClient.warmup: connect + wait transcript.created + close
-                return await client.warmup(timeout=5.0)  # type: ignore[attr-defined]
-            t0 = time.time()
-            try:
-                await client.__aenter__()
-            finally:
-                try:
-                    await client.__aexit__(None, None, None)
-                except Exception:
-                    pass
-            return time.time() - t0
-
         while True:
+            cfg = self._cfg
+            audio_cfg = _section(cfg, "audio")
+            try:
+                sample_rate = int(
+                    _finite_float(audio_cfg.get("sample_rate", 16000), 16000)
+                )
+            except (TypeError, ValueError):
+                sample_rate = 16000
+            if sample_rate <= 0:
+                sample_rate = 16000
+            provider = cfg.get("provider") or "doubao"
+
+            async def _one_warmup() -> float:
+                client = make_streaming_client(cfg, sample_rate=sample_rate)
+                if provider == "grok":
+                    # GrokSttClient.warmup: connect + wait transcript.created + close
+                    return await client.warmup(timeout=5.0)  # type: ignore[attr-defined]
+                t0 = time.time()
+                try:
+                    await client.__aenter__()
+                finally:
+                    try:
+                        await client.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                return time.time() - t0
+
             try:
                 loop = asyncio.new_event_loop()
                 try:
@@ -1054,7 +1326,8 @@ class SpitchDaemon:
                 log.info("network warmup: %.2fs", elapsed)
             except Exception as exc:
                 log.warning("network warmup failed: %s", exc)
-            time.sleep(240.0)  # 4 min
+            self._warmup_kick.wait(timeout=240.0)
+            self._warmup_kick.clear()
 
     def _shutdown(self) -> None:
         """Clean shutdown: stop hotkey listener and close the mic.
@@ -1064,27 +1337,37 @@ class SpitchDaemon:
         of the daemon doesn't hit "device busy" on the same hardware.
         Also tear down the cmd socket so a stale path doesn't fool
         ``spitch-cli`` next time the daemon starts.
+
+        Each step is individually try/except'd and never allowed to
+        raise — the hard-exit watchdog in :meth:`_request_exit` is the
+        backstop if anything here blocks past ``_SHUTDOWN_HARD_EXIT_S``.
         """
+        log.info("shutdown: tearing down")
         if self._cmdserver is not None:
             try:
                 self._cmdserver.stop()
             except Exception:
-                pass
+                log.exception("shutdown: cmdserver.stop failed")
+            self._cmdserver = None
         if self._listener is not None:
             try:
                 self._listener.stop()
             except Exception:
-                pass
+                log.exception("shutdown: hotkey listener stop failed")
+            self._listener = None
         if self._salmon_listener is not None:
             try:
                 self._salmon_listener.stop()
             except Exception:
-                pass
+                log.exception("shutdown: salmon listener stop failed")
+            self._salmon_listener = None
         if self._audio is not None:
             try:
                 self._audio.close()
             except Exception:
-                pass
+                log.exception("shutdown: audio.close failed")
+            self._audio = None
+        log.info("shutdown: complete")
 
 
 def main(argv: list[str] | None = None) -> int:

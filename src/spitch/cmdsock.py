@@ -224,14 +224,41 @@ class CmdServer:
         self._thread.start()
         log.info("cmd socket listening at %s", self._path)
 
-    def stop(self) -> None:
-        if self._server is not None:
-            try:
-                self._server.shutdown()
-                self._server.server_close()
-            except Exception:
-                pass
-            self._server = None
+    def stop(self, *, timeout: float = 2.0) -> None:
+        """Stop the listener.
+
+        ``BaseServer.shutdown()`` blocks until ``serve_forever`` exits.
+        Run it on a helper thread with ``timeout`` so a wedged accept
+        loop cannot pin the daemon's SIGTERM path forever (systemd
+        would otherwise sit in ``stop-sigterm`` until TimeoutStopSec).
+        """
+        server = self._server
+        self._server = None
+        thread = self._thread
+        self._thread = None
+        if server is not None:
+            def _do() -> None:
+                try:
+                    server.shutdown()
+                except Exception:
+                    pass
+                try:
+                    server.server_close()
+                except Exception:
+                    pass
+
+            stopper = threading.Thread(
+                target=_do, name="spitch-cmdsock-stop", daemon=True,
+            )
+            stopper.start()
+            stopper.join(timeout=timeout)
+            if stopper.is_alive():
+                log.warning(
+                    "cmdsock stop timed out after %.1fs — abandoning server",
+                    timeout,
+                )
+            if thread is not None:
+                thread.join(timeout=0.2)
         try:
             if self._path.exists():
                 self._path.unlink()
@@ -286,3 +313,31 @@ def call(op: str, *, timeout: float = 5.0, path: Path | None = None,
             s.close()
         except OSError:
             pass
+
+
+def request_reload(*, timeout: float = 8.0, path: Path | None = None) -> dict:
+    """Ask the running daemon to re-read ``config.json``.
+
+    Returns the daemon response, or ``{"ok": False, "offline": True, ...}``
+    if the process is not up — callers that just saved a file should
+    treat that as "saved, start the daemon to use it" rather than a
+    hard failure.
+    """
+    try:
+        return call("reload_config", timeout=timeout, path=path)
+    except ConnectionError as exc:
+        return {"ok": False, "offline": True, "error": str(exc)}
+
+
+def describe_reload(resp: dict) -> str:
+    """English one-liner for config UI / CLI after ``request_reload``."""
+    if resp.get("offline"):
+        return "daemon not running — start spitch-daemon to use the new config"
+    if not resp.get("ok"):
+        return f"daemon kept the previous config ({resp.get('error', 'reload failed')})"
+    if resp.get("deferred"):
+        return (
+            "daemon will switch when the current session ends "
+            f"(next provider={resp.get('provider', '?')})"
+        )
+    return f"daemon now using provider={resp.get('provider', '?')}"

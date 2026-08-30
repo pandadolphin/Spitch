@@ -338,6 +338,14 @@ class ParseAndEndpointTests(unittest.TestCase):
         self.assertEqual(cat, "invalid_configuration")
         self.assertIn("400", msg)
 
+        class E403(Exception):
+            status_code = 403
+
+        cat, msg = classify_ws_connect_error(E403())
+        self.assertEqual(cat, "permission_denied")
+        self.assertIn("403", msg)
+        self.assertIn("console.x.ai", msg)
+
         class E429(Exception):
             status_code = 429
 

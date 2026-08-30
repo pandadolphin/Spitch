@@ -317,6 +317,14 @@ def classify_ws_connect_error(exc: BaseException) -> tuple[str, str]:
         return "credentials_rejected", "credentials rejected (HTTP 401)"
     if status == 400:
         return "invalid_configuration", "invalid configuration (HTTP 400)"
+    if status == 403:
+        # xAI: key/team lacks permission, team blocked, or billing/spend limit —
+        # not the same as a missing/invalid token (401).
+        return (
+            "permission_denied",
+            "permission denied (HTTP 403) — check console.x.ai credits, "
+            "spending limit, and that this API key is allowed for STT",
+        )
     if status == 429:
         return "rate_limited", "rate limited (HTTP 429); retry later"
     if status is not None and 500 <= status <= 599:
@@ -581,6 +589,8 @@ class GrokSttClient:
         send_task = asyncio.create_task(self._send_audio(audio_iter))
         recv_task: asyncio.Task | None = None
         sender_done_ok = False
+        n_events = 0
+        n_nonempty = 0
 
         try:
             while True:
@@ -642,6 +652,7 @@ class GrokSttClient:
                         continue
                     _assert_no_doubao_utterances(obj)
                     etype = obj.get("type")
+                    n_events += 1
                     if etype == "error":
                         raise GrokProtocolError(
                             f"server error: {obj.get('message') or obj!r}"
@@ -660,15 +671,27 @@ class GrokSttClient:
                             start=start,
                             duration=duration,
                         )
+                        if full:
+                            n_nonempty += 1
                         yield TranscriptEvent(text=full, is_final=False, raw=dict(obj))
                     elif etype == "transcript.done":
                         done_text = obj.get("text")
                         full = acc.on_done(
                             done_text if isinstance(done_text, str) else None
                         )
+                        if full:
+                            n_nonempty += 1
+                        logger.info(
+                            "grok stream done: events=%d nonempty=%d text_len=%d",
+                            n_events, n_nonempty, len(full),
+                        )
                         yield TranscriptEvent(text=full, is_final=True, raw=dict(obj))
                         return
-                    # transcript.created already handled; ignore other types
+                    else:
+                        logger.info(
+                            "grok ignored event type=%r keys=%s",
+                            etype, sorted(obj.keys()),
+                        )
         finally:
             if not send_task.done():
                 send_task.cancel()
@@ -700,6 +723,10 @@ class GrokSttClient:
 
         try:
             async for chunk in _drain_chunks():
+                if not chunk:
+                    # Controller keep-alives are empty bytes; Grok treats
+                    # an empty binary frame as undecodable audio.
+                    continue
                 await self._ws.send(chunk)
         except Exception:
             # Propagate iterator / send failures to the stream consumer

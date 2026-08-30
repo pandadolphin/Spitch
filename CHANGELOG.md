@@ -4,6 +4,69 @@
 
 ## Unreleased
 
+### Provider switch without restarting the daemon
+
+- `reload_config` is implemented. Saving in `spitch-config` / the
+  console Settings tab (or `spitch-cli reload`) rebuilds the voice
+  factory, hotkeys, and audio from `config.json` while IDLE. A session
+  in flight defers the switch until release.
+- Incomplete or unverified configs are rejected; the running provider
+  stays put (no more “disk says Grok, process still Doubao” after a
+  save-without-probe).
+- Network warmup rereads `self._cfg` each cycle and is kicked immediately
+  on a provider switch.
+
+### Grok switch: no more 2s crash loop; empty transcript fails fast
+
+- Switching `provider` without a fresh **Test connection** used to
+  `systemctl --user` restart-loop every 2s (`not verified`). Unit now
+  has `RestartPreventExitStatus=2 3`.
+- Grok often ends with empty `transcript.done` (no `on_final`); inject
+  used to wait the full ~31s. IDLE now unblocks the inject queue.
+  Empty Grok sessions notify instead of hanging.
+
+### Console: restart daemon button
+
+- Settings tab adds **重启 daemon**. Prefer
+  `systemctl --user restart spitch.service` (rewrites the user unit so
+  `TimeoutStopSec` / `KillMode` pick up); otherwise SIGTERM only
+  `python -m spitch` (not `spitch.ui.console` / cli / config) and
+  respawn `~/.local/bin/spitch-daemon`. The console stays up.
+- Save no longer prints a `pkill -f` one-liner (that pattern also
+  matched the console process).
+
+### Right Alt as hold-to-talk
+
+- `hotkey.talk_key` still defaults to a two-modifier chord (`Ctrl+Alt`).
+  Generic single `Alt`/`Ctrl`/`Shift`/`Super` stay rejected (they fire
+  on everyday shortcuts). `RightAlt` / `RightCtrl` are allowed as a
+  single hold: US layout Right Alt is `Alt_R`, not AltGr, and is far
+  from Super so it is not confused with `Ctrl+Win`.
+- `parse_combo` accepts `RightAlt`, `RAlt`, `AltGr`, `Right+Alt`, and
+  the same pattern for `RightCtrl`. Left Alt does not start a RightAlt
+  session.
+- `talk_key` may list alternatives: `RightAlt, RightCtrl` (or `or` /
+  `|`). Either key starts a session; the session ends when none of
+  them remain held.
+
+### Daemon stop no longer hangs on SIGTERM
+
+- **Root cause:** `systemctl --user restart/stop spitch` could sit in
+  `stop-sigterm` until a manual `SIGKILL`. Two paths compounded:
+  (1) tray About used `Gtk.AboutDialog.run()`, a nested main loop —
+  `Gtk.main_quit()` only pops one level and the GLib signal source
+  used `SOURCE_REMOVE`, so further SIGTERMs were ignored; (2) clean
+  shutdown had no wall-clock bound (`cmdsock.shutdown()` waits on
+  `serve_forever`; systemd unit used the manager default
+  `TimeoutStopSec`, often 90s).
+- **Fix:** `_request_exit` arms a 5s `os._exit` watchdog, cancels
+  in-flight voice, and drains every Gtk main level via idle; About
+  is non-modal `show()`; `CmdServer.stop` joins with timeout; unit
+  gains `TimeoutStopSec=8` + `KillMode=mixed`; console/config are
+  spawned with `start_new_session=True` so they leave the service
+  cgroup. Re-enable autostart (or rewrite the unit) to pick up the
+  unit changes.
+
 ### Multi-provider Grok Streaming STT
 
 - **Multi-provider:** `provider: "doubao" | "grok"`. Doubao remains the

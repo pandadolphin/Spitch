@@ -2,12 +2,17 @@
 
 Spitch's daemon is a long-lived per-user process; the natural place
 for it to live across reboots is a systemd user unit. This module
-hides the systemctl invocations behind three small functions:
+hides the systemctl invocations behind small functions:
 
   * :func:`is_supported` — does this system actually have ``systemctl``
     + a running ``--user`` instance?
   * :func:`is_enabled` — is the spitch unit currently enabled?
-  * :func:`enable` / :func:`disable` — flip it.
+  * :func:`is_active` — is the unit currently running?
+  * :func:`enable` / :func:`disable` — flip autostart.
+  * :func:`restart` — bounce the daemon so config changes take effect
+    (console Settings tab). Prefers ``systemctl --user restart``;
+    otherwise SIGTERM ``python -m spitch`` (not console/cli/config)
+    and respawn the launcher.
 
 The unit file lives at ``~/.config/systemd/user/spitch.service`` and
 is owned and managed by Spitch. ``enable`` writes / overwrites it
@@ -34,12 +39,19 @@ Caveats — surfaced to the UI as needed:
 from __future__ import annotations
 
 import os
+import signal
 import shutil
 import subprocess
+import time
 from pathlib import Path
-from typing import Tuple
+from typing import Sequence, Tuple
 
 UNIT_NAME = "spitch.service"
+
+# ``python -m <mod>`` modules that are the daemon itself. Console / cli /
+# config_dialog are ``spitch.ui.*`` / ``spitch.cli`` and must survive a
+# restart triggered from those processes.
+_DAEMON_MODULES = frozenset({"spitch", "spitch.daemon", "spitch.__main__"})
 
 
 def unit_dir() -> Path:
@@ -73,6 +85,16 @@ def render_unit() -> str:
         f"ExecStart={daemon_launcher_path()}\n"
         "Restart=on-failure\n"
         "RestartSec=2\n"
+        # Exit 2 = incomplete / not verified (user must re-probe after
+        # switching provider). Exit 3 = no readable /dev/input devices.
+        # Restarting those every 2s just floods daemon.log.
+        "RestartPreventExitStatus=2 3\n"
+        # Bound stop so a wedged clean-exit path cannot strand the unit
+        # in stop-sigterm for the manager default (often 90s). mixed:
+        # SIGTERM the main process first; after the timeout SIGKILL the
+        # whole cgroup (arecord children, any non-detached helpers).
+        "TimeoutStopSec=8\n"
+        "KillMode=mixed\n"
         "\n"
         "[Install]\n"
         "WantedBy=graphical-session.target\n"
@@ -135,6 +157,169 @@ def is_enabled() -> bool:
         return (r.stdout or "").strip() == "enabled"
     except (subprocess.TimeoutExpired, OSError):
         return False
+
+
+def is_active() -> bool:
+    """Is the systemd user unit currently running?
+
+    False when systemctl is missing, the unit is inactive/failed, or
+    the query times out. Does not look at a manually-launched daemon.
+    """
+    if shutil.which("systemctl") is None:
+        return False
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-active", UNIT_NAME],
+            capture_output=True, timeout=2.0, text=True,
+        )
+        return (r.stdout or "").strip() == "active"
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def is_daemon_argv(argv: Sequence[str]) -> bool:
+    """True if ``argv`` is the Spitch daemon, not console / cli / config.
+
+    Matches ``python -m spitch`` (and ``spitch.daemon`` /
+    ``spitch.__main__``). Rejects ``python -m spitch.ui.console`` so a
+    restart from the Settings tab cannot kill the window that issued it.
+    """
+    parts = [p for p in argv if p]
+    for i, part in enumerate(parts):
+        if part == "-m" and i + 1 < len(parts):
+            return parts[i + 1] in _DAEMON_MODULES
+    return False
+
+
+def _daemon_pids() -> list[int]:
+    """PIDs whose cmdline is the daemon. Skips our own process."""
+    my_pid = os.getpid()
+    found: list[int] = []
+    proc = Path("/proc")
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        name = entry.name
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == my_pid:
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        argv = [p.decode("utf-8", "replace") for p in raw.split(b"\0") if p]
+        if is_daemon_argv(argv):
+            found.append(pid)
+    return found
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _stop_loose_daemons(*, timeout: float = 6.0) -> None:
+    """SIGTERM (then SIGKILL) any non-systemd ``python -m spitch``.
+
+    Timeout matches the daemon's 5s shutdown watchdog plus slack.
+    """
+    pids = _daemon_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + timeout
+    remaining = set(pids)
+    while remaining and time.time() < deadline:
+        remaining = {pid for pid in remaining if _pid_alive(pid)}
+        if remaining:
+            time.sleep(0.1)
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _spawn_launcher() -> Tuple[bool, str]:
+    launcher = daemon_launcher_path()
+    if not launcher.exists():
+        return False, (
+            f"找不到 daemon launcher：{launcher}。请先跑 ./scripts/install.sh"
+        )
+    try:
+        subprocess.Popen(
+            [str(launcher)],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        return False, f"启动失败：{exc}"
+    return True, "daemon 已重新启动"
+
+
+def restart() -> Tuple[bool, str]:
+    """Bounce the daemon so a saved config takes effect.
+
+    When the user unit file exists and ``systemctl --user`` works:
+    rewrite the unit (picks up TimeoutStopSec / KillMode changes),
+    ``daemon-reload``, then ``restart``. If the unit is not active,
+    any leftover manual ``python -m spitch`` is stopped first so we
+    do not end up with two daemons.
+
+    Otherwise stop leftover daemon PIDs and spawn the install.sh
+    launcher in a new session (console stays up).
+    """
+    if is_supported() and unit_path().exists():
+        if not is_active():
+            _stop_loose_daemons()
+        try:
+            unit_path().write_text(render_unit(), encoding="utf-8")
+        except OSError as exc:
+            return False, f"更新 unit 文件失败：{exc}"
+        try:
+            r = subprocess.run(
+                ["systemctl", "--user", "daemon-reload"],
+                capture_output=True, timeout=5.0, text=True,
+            )
+            if r.returncode != 0:
+                return False, f"daemon-reload 失败：{(r.stderr or '').strip()}"
+            r = subprocess.run(
+                ["systemctl", "--user", "restart", UNIT_NAME],
+                capture_output=True, timeout=20.0, text=True,
+            )
+            if r.returncode != 0:
+                return False, f"restart 失败：{(r.stderr or '').strip()}"
+            return True, "daemon 已重启（systemd --user）"
+        except subprocess.TimeoutExpired:
+            return False, "systemctl restart 超时"
+        except OSError as exc:
+            return False, f"systemctl 调用失败：{exc}"
+
+    _stop_loose_daemons()
+    return _spawn_launcher()
+
+
+def restart_if_running() -> Tuple[bool, str]:
+    """Reload saved configuration without unexpectedly starting Spitch.
+
+    ``spitch-config`` uses this after a verified save. A running systemd
+    service or loose ``python -m spitch`` process is restarted; when no
+    daemon is running, the next normal start will read the new config.
+    """
+    if is_active() or _daemon_pids():
+        return restart()
+    return True, "配置已保存；daemon 未运行，将在下次启动时生效"
 
 
 def enable() -> Tuple[bool, str]:

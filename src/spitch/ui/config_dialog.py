@@ -34,11 +34,13 @@ from ..config import (
     credentials_signature,
     default_config,
     is_complete,
+    is_verified,
     load_config,
     mark_verified,
     save_config,
 )
 from .probe import probe_credentials_for_config
+from ..cmdsock import describe_reload, request_reload
 
 # Product language gate — shown whenever provider=grok is selected.
 _GROK_TITLE = "Grok STT (language support: validate before relying on 中文)"
@@ -184,6 +186,8 @@ def run_cli(probe: bool = True) -> int:
 
     path = save_config(cfg)
     sys.stderr.write(f"\nSaved {path}\n")
+    if probe and is_verified(cfg):
+        sys.stderr.write(describe_reload(request_reload()) + "\n")
     return 0
 
 
@@ -483,13 +487,14 @@ def run_gtk() -> int:  # pragma: no cover - GUI is exercised manually
         path = save_config(new_cfg)
         if verified_now:
             set_status(
-                f"Saved → {path}\nVerified — voice mode is enabled.",
+                f"Saved → {path}\nVerified — {describe_reload(request_reload())}",
                 ok=True,
             )
         else:
             note = (
                 "Saved → {p}\nVoice mode stays disabled until ‘Test connection’ "
-                "succeeds with the current values."
+                "succeeds with the current values. Daemon keeps the previous "
+                "provider until a probe succeeds."
             ).format(p=path)
             set_status(note, ok=False)
 

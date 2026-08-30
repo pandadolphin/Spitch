@@ -12,7 +12,12 @@ import threading
 import time
 import unittest
 
-from spitch.hotkey.evdev_listener import HotkeyListener, parse_combo
+from spitch.hotkey.evdev_listener import (
+    HotkeyListener,
+    format_talk_keys,
+    parse_combo,
+    parse_talk_keys,
+)
 
 try:
     import evdev  # noqa: F401
@@ -40,6 +45,37 @@ class ParseComboTests(unittest.TestCase):
 
     def test_super_synonym(self):
         self.assertEqual(parse_combo("Win+Ctrl"), ["super", "ctrl"])
+
+    def test_rightalt_forms(self):
+        for spec in ("RightAlt", "RAlt", "AltGr", "right-alt", "Right+Alt"):
+            self.assertEqual(parse_combo(spec), ["rightalt"], spec)
+
+    def test_rightctrl_forms(self):
+        self.assertEqual(parse_combo("RightCtrl"), ["rightctrl"])
+        self.assertEqual(parse_combo("RCtrl"), ["rightctrl"])
+
+    def test_spaces_stripped(self):
+        self.assertEqual(parse_combo("Ctrl + Alt"), ["ctrl", "alt"])
+        self.assertEqual(parse_combo("Right Alt"), ["rightalt"])
+
+    def test_talk_keys_single(self):
+        self.assertEqual(parse_talk_keys("Ctrl+Alt"), [["ctrl", "alt"]])
+
+    def test_talk_keys_alternatives(self):
+        self.assertEqual(
+            parse_talk_keys("RightAlt, RightCtrl"),
+            [["rightalt"], ["rightctrl"]],
+        )
+        self.assertEqual(
+            parse_talk_keys("RightAlt or RightCtrl"),
+            [["rightalt"], ["rightctrl"]],
+        )
+
+    def test_format_talk_keys(self):
+        self.assertEqual(
+            format_talk_keys([["rightalt"], ["rightctrl"]]),
+            "Right Alt or Right Ctrl",
+        )
 
 
 @unittest.skipUnless(_HAS_EVDEV, "evdev module unavailable")
@@ -70,6 +106,50 @@ class HotkeyListenerInitTests(unittest.TestCase):
             on_press=lambda: None,
             on_release=lambda: None,
         )
+
+    def test_accepts_rightalt_when_opted_in(self):
+        HotkeyListener(
+            ["rightalt"],
+            on_press=lambda: None,
+            on_release=lambda: None,
+            allow_single_mod=True,
+        )
+
+    def test_rightalt_ignores_left_alt(self):
+        from evdev import ecodes as ec
+        presses: list[str] = []
+        listener = HotkeyListener(
+            ["rightalt"],
+            on_press=lambda: presses.append("press"),
+            on_release=lambda: presses.append("release"),
+            allow_single_mod=True,
+        )
+        listener._on_key(ec.KEY_LEFTALT, 1)
+        self.assertEqual(presses, [])
+        listener._on_key(ec.KEY_RIGHTALT, 1)
+        self.assertEqual(presses, ["press"])
+        listener._on_key(ec.KEY_RIGHTALT, 0)
+        self.assertEqual(presses, ["press", "release"])
+
+    def test_rightalt_or_rightctrl(self):
+        from evdev import ecodes as ec
+        presses: list[str] = []
+        listener = HotkeyListener(
+            alternatives=[["rightalt"], ["rightctrl"]],
+            on_press=lambda: presses.append("press"),
+            on_release=lambda: presses.append("release"),
+            allow_single_mod=True,
+        )
+        listener._on_key(ec.KEY_LEFTCTRL, 1)
+        self.assertEqual(presses, [])
+        listener._on_key(ec.KEY_RIGHTCTRL, 1)
+        self.assertEqual(presses, ["press"])
+        listener._on_key(ec.KEY_RIGHTALT, 1)
+        self.assertEqual(presses, ["press"])
+        listener._on_key(ec.KEY_RIGHTCTRL, 0)
+        self.assertEqual(presses, ["press"])
+        listener._on_key(ec.KEY_RIGHTALT, 0)
+        self.assertEqual(presses, ["press", "release"])
 
 
 @unittest.skipUnless(_HAS_EVDEV, "evdev module unavailable")

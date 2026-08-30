@@ -189,7 +189,16 @@ class SpitchIndicator:
     def _on_open_console(self, _widget):
         import shutil, subprocess
         if shutil.which("spitch-console"):
-            subprocess.Popen(["spitch-console"])
+            # Detach from the daemon's systemd cgroup/session so a
+            # long-lived console window cannot block `systemctl stop`
+            # under KillMode=control-group.
+            subprocess.Popen(
+                ["spitch-console"],
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         else:
             log.info("spitch-console not on PATH; re-run install.sh")
 
@@ -206,7 +215,13 @@ class SpitchIndicator:
     def _on_open_config(self, _widget):
         import shutil, subprocess
         if shutil.which("spitch-config"):
-            subprocess.Popen(["spitch-config"])
+            subprocess.Popen(
+                ["spitch-config"],
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
     def _on_about(self, _widget):
         Gtk = self._Gtk
@@ -240,8 +255,13 @@ class SpitchIndicator:
                 dlg.set_logo(pixbuf)
         except Exception as exc:
             log.debug("about logo unavailable: %s", exc)
-        dlg.run()
-        dlg.destroy()
+        # Non-blocking: dlg.run() pushes a nested Gtk.main level, and
+        # a single SIGTERM/main_quit only pops that level — leaving the
+        # daemon's outer main loop running so systemd sits in
+        # stop-sigterm. show() keeps a single main level.
+        dlg.set_modal(True)
+        dlg.connect("response", lambda d, _r: d.destroy())
+        dlg.show_all()
 
     def _on_quit_clicked(self, _widget):
         if callable(self._on_quit):

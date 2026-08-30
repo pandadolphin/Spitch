@@ -3,12 +3,13 @@
 Tabs:
   * 历史 — recent transcripts; per-row [复制] [重粘] [删除] buttons.
   * 日志 — tail of ``daemon.log`` with auto-scroll, [清空] [打开文件].
-  * 设置 — common config knobs as widgets, [应用 + 重启 daemon].
+  * 设置 — common config knobs as widgets, [保存] + [重启 daemon].
 
 All daemon RPC goes through :mod:`spitch.cmdsock` (history list /
-repaste / clear). Config save uses :mod:`spitch.config` directly and
-asks the user to restart the daemon afterwards (we don't yet support
-hot-reload of voice controller).
+repaste / clear). Config save uses :mod:`spitch.config` directly.
+Saving settings (or switching provider in spitch-config) asks the
+running daemon to ``reload_config`` so the next press uses the new
+snapshot. The restart button remains for a wedged process / unit file.
 
 Falls back gracefully when GTK / PyGObject is missing — emits a
 short hint to stderr and exits 1, suggesting the CLI alternatives
@@ -24,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import __version__
-from ..cmdsock import call as cmd_call
+from ..cmdsock import call as cmd_call, request_reload
 
 
 def _state_log_path() -> Path:
@@ -382,6 +383,7 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
     e_talk = Gtk.Entry()
     e_talk.set_text(h.get("talk_key", "Ctrl+Alt"))
     e_talk.set_hexpand(True)
+    e_talk.set_placeholder_text("Ctrl+Alt or RightAlt, RightCtrl")
     add_row(0, "热键 (talk_key)", e_talk)
 
     e_paste = Gtk.Entry()
@@ -442,8 +444,7 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
         label=(
             f"配置文件：{config_path()}\n"
             f"凭据：{'✓ 已配置 + 已验证' if is_complete(cfg) else '✗ 未配置（先跑 spitch-config）'}\n"
-            f"修改后点'保存并提示重启' — daemon 不会自动 reload，"
-            f"得手动 kill 然后启动 spitch-daemon。"
+            f"保存后 daemon 热加载；录音中会等松开再切换。"
         ),
         xalign=0.0,
     )
@@ -452,8 +453,15 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
 
     actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
     btn_save = Gtk.Button(label="保存")
+    btn_restart = Gtk.Button(label="重启 daemon")
+    btn_restart.set_tooltip_text(
+        "systemctl --user restart（有 user unit 时），"
+        "否则杀掉 python -m spitch 再拉起 spitch-daemon。"
+        "控制台窗口会留着。"
+    )
     btn_open_config = Gtk.Button(label="打开 spitch-config（凭据 / 测试连接）")
     actions.pack_start(btn_save, False, False, 0)
+    actions.pack_start(btn_restart, False, False, 0)
     actions.pack_end(btn_open_config, False, False, 0)
     box.pack_start(actions, False, False, 0)
 
@@ -462,7 +470,9 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
 
     def on_save(_b):
         new_cfg = default_config()
-        new_cfg.update(cfg)  # preserve doubao + verified_at
+        # Re-read disk so a provider switch in spitch-config is not
+        # clobbered by the snapshot taken when this tab opened.
+        new_cfg.update(load_config())
         new_cfg["hotkey"] = dict(new_cfg.get("hotkey") or {})
         new_cfg["hotkey"]["talk_key"] = e_talk.get_text().strip() or "Ctrl+Alt"
         new_cfg["inject"] = dict(new_cfg.get("inject") or {})
@@ -474,9 +484,57 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
         new_cfg["audio"]["pause_media_on_talk"] = bool(cb_pause_media.get_active())
         try:
             path = save_config(new_cfg)
-            status.set_text(f"已保存 → {path}\n手动重启 daemon 后生效：pkill -f 'python3? -m spitch' && spitch-daemon &")
+            resp = request_reload()
+            if resp.get("offline"):
+                extra = "daemon 没在跑 — 启动后会用这份配置"
+            elif not resp.get("ok"):
+                extra = f"daemon 未切换：{resp.get('error', 'reload failed')}"
+            elif resp.get("deferred"):
+                extra = "当前还在说话，松开后会应用"
+            else:
+                extra = f"已生效（provider={resp.get('provider', '?')}）"
+            status.set_text(f"已保存 → {path}\n{extra}")
         except Exception as exc:
             status.set_text(f"保存失败：{exc}")
+
+    def on_restart(_b):
+        btn_restart.set_sensitive(False)
+        status.set_text("正在重启 daemon…")
+
+        def worker():
+            ok, msg = _autostart.restart()
+            if ok:
+                ready = False
+                version = ""
+                for _ in range(40):
+                    try:
+                        resp = cmd_call("ping", timeout=0.4)
+                        if resp.get("ok"):
+                            ready = True
+                            version = str(resp.get("version") or "")
+                            break
+                    except ConnectionError:
+                        pass
+                    time.sleep(0.2)
+                if ready:
+                    suffix = f"（v{version}）" if version else ""
+                    text = f"✓ {msg}{suffix}"
+                else:
+                    text = f"⚠ {msg}，但尚未就绪 — 看日志或凭据"
+            else:
+                text = "⚠ " + msg
+
+            def done():
+                status.set_text(text)
+                btn_restart.set_sensitive(True)
+                return False
+
+            GLib.idle_add(done)
+
+        import threading
+        threading.Thread(
+            target=worker, name="spitch-restart-daemon", daemon=True,
+        ).start()
 
     def on_open_config(_b):
         import shutil, subprocess
@@ -522,6 +580,7 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
 
     cb_autostart.connect("toggled", on_autostart_toggled)
     btn_save.connect("clicked", on_save)
+    btn_restart.connect("clicked", on_restart)
     btn_open_config.connect("clicked", on_open_config)
     return box
 

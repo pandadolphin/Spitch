@@ -138,13 +138,9 @@ invalidates verification until you probe again.
 ### Rollback to Doubao
 
 Set `"provider": "doubao"` (via `spitch-config` or hand-edit) with valid
-Doubao credentials, run **Test connection**, and restart the daemon:
-
-```bash
-# after spitch-config saves provider=doubao + probe OK
-systemctl --user restart spitch.service   # if using systemd
-# or: kill the daemon and run spitch-daemon again
-```
+Doubao credentials and run **Test connection**. A running daemon reloads
+the new provider without a process restart (`spitch-cli reload` if you
+edited the file by hand).
 
 An older binary that does not understand Grok will treat
 `provider=grok` as incomplete until you switch back or upgrade.

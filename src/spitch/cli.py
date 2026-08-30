@@ -7,6 +7,7 @@ Wraps :mod:`spitch.cmdsock` so users can:
   * ``spitch-cli list``              — print history (newest last)
   * ``spitch-cli clear``             — wipe history
   * ``spitch-cli ping``              — verify daemon is reachable
+  * ``spitch-cli reload``            — re-read config.json (provider switch)
 
 Useful by itself, but the main reason this exists is so users can bind
 ``spitch-cli repaste`` to a system shortcut (GNOME Settings → Custom
@@ -23,6 +24,7 @@ import time
 from typing import Any
 
 from .cmdsock import call as cmd_call
+from .cmdsock import request_reload
 
 
 def _print_err(msg: str) -> None:
@@ -46,7 +48,10 @@ def cmd_ping(args: argparse.Namespace) -> int:
         _print_err(str(exc))
         return 2
     if resp.get("ok"):
-        print(f"daemon ok, version={resp.get('version', '?')}")
+        print(
+            f"daemon ok, version={resp.get('version', '?')} "
+            f"provider={resp.get('provider', '?')}"
+        )
         return 0
     _print_err(resp.get("error", "unknown error"))
     return 1
@@ -114,6 +119,27 @@ def cmd_delete(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reload(args: argparse.Namespace) -> int:
+    resp = request_reload()
+    if resp.get("offline"):
+        _print_err(resp.get("error", "daemon not running"))
+        return 2
+    if not resp.get("ok"):
+        _print_err(resp.get("error", "unknown error"))
+        return 1
+    if resp.get("deferred"):
+        print(
+            f"reload deferred until idle "
+            f"(next provider={resp.get('provider', '?')})"
+        )
+        return 0
+    print(
+        f"reloaded provider={resp.get('provider', '?')} "
+        f"talk_key={resp.get('talk_key', '?')}"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="spitch-cli",
@@ -146,6 +172,10 @@ def main(argv: list[str] | None = None) -> int:
     delete_p.add_argument("index", type=int, help="chronological index to delete")
 
     sub.add_parser("clear", help="wipe all history")
+    sub.add_parser(
+        "reload",
+        help="re-read config.json on the running daemon (provider / hotkey)",
+    )
 
     args = parser.parse_args(argv)
     handlers = {
@@ -154,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         "repaste": cmd_repaste,
         "delete":  cmd_delete,
         "clear":   cmd_clear,
+        "reload":  cmd_reload,
     }
     return handlers[args.cmd](args)
 

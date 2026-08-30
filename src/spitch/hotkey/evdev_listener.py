@@ -15,12 +15,40 @@ from __future__ import annotations
 
 import logging
 import threading
+import re
 from typing import Callable, Iterable
 
 log = logging.getLogger("spitch.hotkey")
 
 
 _MOD_KEYS: dict[str, set[int]] = {}
+
+# Generic Alt/Ctrl/Shift/Super fire on everyday shortcuts (Alt+Tab,
+# Ctrl+C). These sided keys do not, so they are allowed as a single
+# hold-to-talk key. This machine's US layout maps Right Alt to Alt_R,
+# not AltGr.
+TALK_SINGLE_OK = frozenset({"rightalt", "rightctrl"})
+
+_TOKEN_ALIASES = {
+    "ctrl": "ctrl",
+    "control": "ctrl",
+    "alt": "alt",
+    "meta": "alt",
+    "shift": "shift",
+    "super": "super",
+    "win": "super",
+    "rightalt": "rightalt",
+    "ralt": "rightalt",
+    "altgr": "rightalt",
+    "leftalt": "leftalt",
+    "lalt": "leftalt",
+    "rightctrl": "rightctrl",
+    "rctrl": "rightctrl",
+    "leftctrl": "leftctrl",
+    "lctrl": "leftctrl",
+}
+_SIDE_WORDS = {"left": "left", "l": "left", "right": "right", "r": "right"}
+_SIDEABLE = {"alt", "ctrl"}
 
 
 def _init_codes() -> None:
@@ -33,25 +61,91 @@ def _init_codes() -> None:
         "alt":   {ec.KEY_LEFTALT, ec.KEY_RIGHTALT},
         "shift": {ec.KEY_LEFTSHIFT, ec.KEY_RIGHTSHIFT},
         "super": {ec.KEY_LEFTMETA, ec.KEY_RIGHTMETA},
+        "leftalt": {ec.KEY_LEFTALT},
+        "rightalt": {ec.KEY_RIGHTALT},
+        "leftctrl": {ec.KEY_LEFTCTRL},
+        "rightctrl": {ec.KEY_RIGHTCTRL},
     }
 
 
 def parse_combo(spec: str) -> list[str]:
     """Parse ``"Ctrl+Alt"`` → ``['ctrl', 'alt']``. Order-insensitive,
     duplicates removed. Unknown tokens are dropped.
+
+    Sided tokens: ``RightAlt`` / ``RAlt`` / ``AltGr`` / ``Right+Alt``
+    → ``rightalt`` (KEY_RIGHTALT only). Same pattern for ``RightCtrl``.
     """
+    compact = spec.replace(" ", "")
+    raw_parts = [
+        p.strip().lower()
+        for p in compact.replace("-", "+").split("+")
+        if p.strip()
+    ]
+    merged: list[str] = []
+    i = 0
+    while i < len(raw_parts):
+        side = _SIDE_WORDS.get(raw_parts[i])
+        if (
+            side is not None
+            and i + 1 < len(raw_parts)
+            and raw_parts[i + 1] in _SIDEABLE
+        ):
+            merged.append(side + raw_parts[i + 1])
+            i += 2
+            continue
+        merged.append(raw_parts[i])
+        i += 1
     out: list[str] = []
-    for raw in spec.replace("-", "+").split("+"):
-        p = raw.strip().lower()
-        if p in ("ctrl", "control"):
-            p = "ctrl"
-        elif p in ("alt", "meta"):
-            p = "alt"
-        elif p in ("super", "win"):
-            p = "super"
-        if p in ("ctrl", "alt", "shift", "super") and p not in out:
+    for raw in merged:
+        p = _TOKEN_ALIASES.get(raw)
+        if p and p not in out:
             out.append(p)
     return out
+
+
+def parse_talk_keys(spec: str) -> list[list[str]]:
+    """Parse one or more talk combos.
+
+    ``"Ctrl+Alt"`` → ``[['ctrl', 'alt']]``.
+    ``"RightAlt, RightCtrl"`` / ``"RightAlt or RightCtrl"`` →
+    ``[['rightalt'], ['rightctrl']]`` (either key starts a session).
+    """
+    parts = re.split(r"\s*(?:,|\||\bor\b)\s*", spec.strip(), flags=re.IGNORECASE)
+    out: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for part in parts:
+        combo = parse_combo(part)
+        if not combo:
+            continue
+        key = tuple(combo)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(combo)
+    return out
+
+
+def combo_allowed_for_talk(combo: list[str]) -> bool:
+    """True if this combo is safe as a paste-path hold-to-talk key."""
+    if len(combo) >= 2:
+        return True
+    return len(combo) == 1 and combo[0] in TALK_SINGLE_OK
+
+
+_COMBO_LABELS = {
+    "rightalt": "Right Alt",
+    "rightctrl": "Right Ctrl",
+    "leftalt": "Left Alt",
+    "leftctrl": "Left Ctrl",
+}
+
+
+def format_talk_keys(combos: Iterable[Iterable[str]]) -> str:
+    labels = [
+        "+".join(_COMBO_LABELS.get(c, c.title()) for c in combo)
+        for combo in combos
+    ]
+    return " or ".join(labels)
 
 
 def list_keyboards():
@@ -85,37 +179,44 @@ class HotkeyListener:
 
     def __init__(
         self,
-        combo: Iterable[str],
+        combo: Iterable[str] | None = None,
         *,
+        alternatives: Iterable[Iterable[str]] | None = None,
         on_press: Callable[[], None],
         on_release: Callable[[], None],
         on_cancel: Callable[[], None] | None = None,
         allow_single_mod: bool = False,
     ):
         _init_codes()
-        self._wanted = list(combo)
-        if len(self._wanted) < 2 and not allow_single_mod:
-            # Single-modifier push-to-talk is normally unusable: Ctrl
-            # / Alt / Shift / Super get pressed dozens of times per
-            # minute for system shortcuts and would each kick off a
-            # bogus recording. ``allow_single_mod=True`` opts into it
-            # for the salmon-mode subscriber, which routes the
-            # transcript to a dedicated app (the overlay) instead of
-            # pasting into whichever window happens to be focused —
-            # the conflict the gate guards against doesn't apply.
-            raise ValueError(
-                "combo must contain at least two distinct modifier keys "
-                "(got %r) — pass allow_single_mod=True to opt into a "
-                "single-modifier hold" % self._wanted
-            )
+        if alternatives is not None:
+            self._combos = [list(c) for c in alternatives]
+        elif combo is not None:
+            self._combos = [list(combo)]
+        else:
+            raise ValueError("combo or alternatives is required")
+        if not self._combos:
+            raise ValueError("combo or alternatives is required")
+        for wanted in self._combos:
+            if len(wanted) < 2 and not allow_single_mod:
+                # Single-modifier push-to-talk is normally unusable: Ctrl
+                # / Alt / Shift / Super get pressed dozens of times per
+                # minute for system shortcuts and would each kick off a
+                # bogus recording. ``allow_single_mod=True`` opts into it
+                # for salmon-mode and for sided singles (RightAlt / RightCtrl).
+                raise ValueError(
+                    "combo must contain at least two distinct modifier keys "
+                    "(got %r) — pass allow_single_mod=True to opt into a "
+                    "single-modifier hold" % wanted
+                )
+        names = [m for c in self._combos for m in c]
         self._wanted_codes: set[int] = set().union(
-            *(_MOD_KEYS[m] for m in self._wanted)
-        )
+            *(_MOD_KEYS[m] for m in names)
+        ) if names else set()
         self._all_mod_codes: set[int] = set().union(*_MOD_KEYS.values())
         self._on_press = on_press
         self._on_release = on_release
         self._on_cancel = on_cancel or (lambda: None)
-        self._held: dict[str, bool] = {m: False for m in self._wanted}
+        self._held: dict[str, bool] = {m: False for m in names}
         self._talk_active = False
         self._stop = threading.Event()
         # Set whenever none of the wanted modifiers is currently held.
@@ -189,7 +290,7 @@ class HotkeyListener:
         is_press = value == 1
         is_release = value == 0
         wanted_mod: str | None = None
-        for name in self._wanted:
+        for name in self._held:
             if code in _MOD_KEYS[name]:
                 wanted_mod = name
                 break
@@ -205,11 +306,13 @@ class HotkeyListener:
                 self._quiescent_event.clear()
             else:
                 self._quiescent_event.set()
-            all_held = all(self._held[m] for m in self._wanted)
-            if all_held and not self._talk_active:
+            any_combo = any(
+                all(self._held[m] for m in combo) for combo in self._combos
+            )
+            if any_combo and not self._talk_active:
                 self._talk_active = True
                 self._safe(self._on_press)
-            elif not all_held and self._talk_active:
+            elif not any_combo and self._talk_active:
                 self._talk_active = False
                 self._safe(self._on_release)
             return
