@@ -584,14 +584,22 @@ class DoubaoClient:
                     yield TranscriptEvent(
                         text=full_text, is_final=is_final, raw=frame.payload
                     )
-                    # Do NOT return on is_final. Doubao splits long
-                    # utterances into multiple definite segments and
-                    # keeps streaming as the user keeps talking; if
-                    # we exit on the first one, everything spoken
-                    # after it is silently lost. The session ends
-                    # naturally when our audio sender finishes (user
-                    # released the talk key, EOS frame went out, ws
-                    # close response comes back).
+                    # A definite segment while audio is still flowing is
+                    # only an utterance boundary; keep streaming or long
+                    # dictation is truncated. Once the sender has finished,
+                    # however, EOS is already on the wire and a definite
+                    # response is the session final. Return immediately
+                    # instead of waiting for the server to close the socket
+                    # (some live connections stay open until our 30 s
+                    # controller timeout, making the next press look dead).
+                    if is_final:
+                        await asyncio.sleep(0)
+                        if (
+                            sender.done()
+                            and not sender.cancelled()
+                            and sender.exception() is None
+                        ):
+                            return
         finally:
             if not sender.done():
                 sender.cancel()

@@ -141,6 +141,50 @@ class StreamingTests(unittest.TestCase):
         sent_audio = b"".join(f.payload for f in audio_frames)
         self.assertEqual(sent_audio, b"".join(chunks))
 
+    def test_stream_returns_after_post_eos_final_without_ws_close(self):
+        """A live Doubao socket may stay open after its final response.
+
+        Once EOS has been sent, a definite result must end ``stream()``;
+        otherwise the controller waits for its full finalize timeout and
+        rejects subsequent hotkey presses in the meantime.
+        """
+
+        class FinalAfterEosWS(FakeWS):
+            async def recv(self) -> bytes:
+                while True:
+                    for raw in self.sent:
+                        frame = DoubaoFrameCodec.decode(raw)
+                        if (
+                            frame.message_type == CLIENT_AUDIO_ONLY_REQUEST
+                            and frame.flags == NEG_WITH_SEQUENCE
+                        ):
+                            return _server_response({
+                                "result": {
+                                    "text": "马上显示。",
+                                    "utterances": [
+                                        {"text": "马上显示。", "definite": True}
+                                    ],
+                                }
+                            })
+                    await asyncio.sleep(0)
+
+        async def _go():
+            client = DoubaoClient(DoubaoCredentials(app_key="A", access_key="B"))
+            ws = FinalAfterEosWS([])
+            client._ws = ws
+
+            async def chunks() -> AsyncIterator[bytes]:
+                yield b"\x00" * 320
+
+            events = []
+            async for event in client.stream(chunks()):
+                events.append(event)
+            return events, ws
+
+        events, ws = asyncio.run(asyncio.wait_for(_go(), timeout=0.5))
+        self.assertEqual([event.text for event in events], ["马上显示。"])
+        self.assertFalse(ws._closed, "stream completion must not require WS close")
+
 
     def test_stream_reconciles_when_server_drops_finalized_utterances(self):
         """Doubao 在多 utterance 场景下会随时把已 finalize 的段从 utterances[]
