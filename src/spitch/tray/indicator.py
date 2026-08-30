@@ -134,7 +134,8 @@ class SpitchIndicator:
     """AppIndicator wrapper with a live label + state icon + small menu."""
 
     def __init__(self, AppIndicator3, *, on_quit=None):
-        from gi.repository import Gtk, GLib
+        from gi.repository import Gtk, GLib, Gdk
+        from ..ui.preedit import PreeditOverlay
         self._Gtk = Gtk
         self._GLib = GLib
         self._on_quit = on_quit
@@ -154,6 +155,7 @@ class SpitchIndicator:
         # and reschedule it as state changes to avoid the linger
         # landing on top of a brand-new RECORDING.
         self._linger_id: int = 0
+        self._preedit = PreeditOverlay(Gtk, GLib, Gdk)
         self._set_icon_for(State.IDLE)
 
     # -- menu ----------------------------------------------------------
@@ -291,6 +293,14 @@ class SpitchIndicator:
     def _apply_state(self, state: State) -> bool:
         self._state = state
         self._set_icon_for(state)
+        if state == State.RECORDING:
+            self._preedit.start()
+        elif state == State.FINALIZING:
+            self._preedit.finalizing()
+        elif state == State.IDLE:
+            self._preedit.finish()
+        else:
+            self._preedit.hide()
         # Going to IDLE: keep the last partial visible briefly so the
         # user sees the final recognition before the tray clears.
         # Any other transition cancels the linger and updates now.
@@ -314,6 +324,7 @@ class SpitchIndicator:
 
     def _apply_partial(self, text: str) -> bool:
         self._partial = text
+        self._preedit.update(text)
         # Any new partial supersedes a pending linger (the user is
         # talking again — the post-final fade should be cut short).
         if self._linger_id:
