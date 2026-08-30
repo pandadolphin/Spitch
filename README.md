@@ -136,6 +136,9 @@ v0.5 起 daemon 维护最近 50 条转写历史，提供三种使用方式：
 **热键按下没反应？**
 看 `~/.local/state/spitch/daemon.log`。最常见的原因是用户没在 `input` 组：`id | grep input` 验证；没有的话 `sudo usermod -aG input $USER` 后重登。
 
+**转写迟钝、漏字、或 Grok 完全没字？**
+先把麦克风拿近再试，不要先换模型。远场/小声时 PCM 能量很低，Grok 的 VAD 会当静音丢掉（表现为「不灵敏」、日志几乎没有 `partial:`、或 `inject: empty transcript`）。2026-08-30 实测：同一套 Grok STT，麦离远时差，贴近所实时且准。豆包同样吃音量，但远场时 Grok 更容易整段空白。
+
 **粘贴失败？**
 托盘通知会写明真实原因（缺 wl-clipboard / `/dev/uinput` 不可写 / 键名错误）。`getfacl /dev/uinput | grep $USER` 检查 ACL。
 
