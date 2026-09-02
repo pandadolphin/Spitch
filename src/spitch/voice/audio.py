@@ -37,17 +37,34 @@ to the ``arecord`` command-line tool — ``arecord`` ships in
 from __future__ import annotations
 
 import collections
+import math
 import queue
 import shutil
 import subprocess
 import threading
 import time
+from array import array
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Callable, Iterator
 
 
 class AudioCaptureError(RuntimeError):
     """Raised when no usable capture backend is available."""
+
+
+def pcm16_dbfs(chunk: bytes) -> float:
+    """Return RMS level for little-endian signed 16-bit PCM."""
+    usable = len(chunk) - (len(chunk) % 2)
+    if usable <= 0:
+        return -96.0
+    samples = array("h")
+    samples.frombytes(chunk[:usable])
+    if not samples:
+        return -96.0
+    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+    if rms <= 0.0:
+        return -96.0
+    return max(-96.0, 20.0 * math.log10(rms / 32768.0))
 
 
 @dataclass
@@ -96,9 +113,16 @@ class AudioCapture:
     closing the mic in continuous mode.
     """
 
-    def __init__(self, config: AudioConfig | None = None, device: str | None = None):
+    def __init__(
+        self,
+        config: AudioConfig | None = None,
+        device: str | None = None,
+        *,
+        on_level: Callable[[float], None] | None = None,
+    ):
         self.config = config or AudioConfig()
         self.device = device
+        self._on_level = on_level
         # Bounded ring buffer for continuous pre-recording. With
         # ``maxlen=0`` (prebuffer disabled) deque.append is a no-op,
         # which is exactly what we want for the legacy behavior — no
@@ -151,14 +175,23 @@ class AudioCapture:
         """
         if not chunk:
             return
+        session_active = False
         with self._lock:
             self._prebuffer.append(chunk)
             self._last_chunk_at = time.monotonic()
             if self._session_active:
+                session_active = True
                 try:
                     self._session_queue.put_nowait(chunk)
                 except queue.Full:
                     pass
+        if session_active and self._on_level is not None:
+            try:
+                self._on_level(pcm16_dbfs(chunk))
+            except Exception:
+                # Metering is diagnostic UI only; it must never interrupt
+                # capture or delay audio delivery to the ASR stream.
+                pass
 
     # ------------------------------------------------------------------
     # backend selection (called from open() / start())

@@ -284,7 +284,8 @@ class SpitchDaemon:
         except (TypeError, ValueError):
             prebuffer_ms = 500
         audio = AudioCapture(
-            AudioConfig(sample_rate=sample_rate, prebuffer_ms=prebuffer_ms)
+            AudioConfig(sample_rate=sample_rate, prebuffer_ms=prebuffer_ms),
+            on_level=self._on_audio_level,
         )
         controller_t, inject_t = _finalize_deadlines(cfg)
         log.info(
@@ -474,6 +475,10 @@ class SpitchDaemon:
             log.exception("deferred reload_config failed")
 
     # -- voice callbacks ----------------------------------------------
+
+    def _on_audio_level(self, dbfs: float) -> None:
+        if self._active_source == "paste" and self._indicator is not None:
+            self._indicator.set_level(dbfs)
 
     def _on_partial(self, text: str) -> None:
         if text:

@@ -8,10 +8,11 @@ entry point the sounddevice callback and the arecord reader call.
 
 from __future__ import annotations
 
+import struct
 import threading
 import unittest
 
-from spitch.voice.audio import AudioCapture, AudioConfig
+from spitch.voice.audio import AudioCapture, AudioConfig, pcm16_dbfs
 
 
 class _Harness(AudioCapture):
@@ -22,13 +23,14 @@ class _Harness(AudioCapture):
     _on_audio with raw PCM bytes.
     """
 
-    def __init__(self, prebuffer_ms: int):
+    def __init__(self, prebuffer_ms: int, *, on_level=None):
         super().__init__(
             AudioConfig(
                 sample_rate=16000,
                 chunk_ms=100,
                 prebuffer_ms=prebuffer_ms,
-            )
+            ),
+            on_level=on_level,
         )
 
     def _open_backend(self) -> str:  # noqa: D401 - test stub
@@ -47,6 +49,28 @@ def _consume(audio: AudioCapture, n: int, timeout: float = 0.5) -> list[bytes]:
         except StopIteration:
             break
     return out
+
+
+class LevelMeterTests(unittest.TestCase):
+    def test_pcm16_dbfs_known_levels(self):
+        self.assertEqual(pcm16_dbfs(b"\x00\x00" * 20), -96.0)
+        half_scale = struct.pack("<h", 16384) * 20
+        self.assertAlmostEqual(pcm16_dbfs(half_scale), -6.02, places=1)
+        full_scale = struct.pack("<h", 32767) * 20
+        self.assertAlmostEqual(pcm16_dbfs(full_scale), 0.0, places=1)
+
+    def test_level_callback_only_runs_during_session(self):
+        levels = []
+        audio = _Harness(prebuffer_ms=500, on_level=levels.append)
+        audio.open()
+        audio._on_audio(struct.pack("<h", 1000) * 20)
+        self.assertEqual(levels, [])
+        audio.start()
+        audio._on_audio(struct.pack("<h", 16384) * 20)
+        audio.stop()
+        self.assertEqual(len(levels), 1)
+        self.assertAlmostEqual(levels[0], -6.02, places=1)
+        audio.close()
 
 
 class PrebufferReplayTests(unittest.TestCase):

@@ -288,6 +288,10 @@ class SpitchIndicator:
         """
         self._GLib.idle_add(self._apply_partial, text or "")
 
+    def set_level(self, dbfs: float) -> None:
+        """Update the live microphone meter from the audio callback thread."""
+        self._GLib.idle_add(self._preedit.update_level, float(dbfs))
+
     # -- internals (must run on GTK thread) ---------------------------
 
     def _apply_state(self, state: State) -> bool:

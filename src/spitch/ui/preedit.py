@@ -20,6 +20,11 @@ def preview_text(text: str, limit: int = 48) -> str:
     return "…" + clean[-(limit - 1) :]
 
 
+def level_fraction(dbfs: float) -> float:
+    """Map useful speech range ``-60..-6 dBFS`` onto ``0..1``."""
+    return max(0.0, min(1.0, (float(dbfs) + 60.0) / 54.0))
+
+
 def overlay_position(
     size: tuple[int, int],
     workarea: tuple[int, int, int, int],
@@ -49,6 +54,7 @@ class PreeditOverlay:
         self._tick_id = 0
         self._hide_id = 0
         self._active = False
+        self._level_dbfs = -96.0
 
         window = Gtk.Window(type=Gtk.WindowType.POPUP)
         window.set_decorated(False)
@@ -86,6 +92,9 @@ class PreeditOverlay:
 
         elapsed = Gtk.Label(label="0:00")
         elapsed.set_name("spitch-preedit-time")
+        level = Gtk.Label(label="−∞ dB")
+        level.set_name("spitch-preedit-level")
+        row.pack_start(level, False, False, 0)
         row.pack_start(elapsed, False, False, 0)
         window.add(frame)
 
@@ -98,6 +107,7 @@ class PreeditOverlay:
                 box-shadow: 0 5px 16px rgba(0, 0, 0, 0.35);
             }
             #spitch-preedit-text { color: #f5f5f7; font-size: 14px; }
+            #spitch-preedit-level { color: #a8a8b3; font-size: 12px; }
             #spitch-preedit-time { color: #f5f5f7; font-size: 14px; }
         """)
         Gtk.StyleContext.add_provider_for_screen(
@@ -107,13 +117,16 @@ class PreeditOverlay:
         self._window = window
         self._label = label
         self._elapsed = elapsed
+        self._level = level
         self._wave = wave
 
     def start(self) -> None:
         self._cancel_hide()
         self._started_at = time.monotonic()
         self._active = True
+        self._level_dbfs = -96.0
         self._label.set_text("听写中…")
+        self._level.set_text("−∞ dB")
         self._elapsed.set_text("0:00")
         self._window.show_all()
         self._position_bottom_center()
@@ -134,6 +147,17 @@ class PreeditOverlay:
     def finalizing(self) -> None:
         if self._active and not self._label.get_text().strip():
             self._label.set_text("转写中…")
+
+    def update_level(self, dbfs: float) -> bool:
+        if not self._active:
+            return False
+        # Fast attack, slower release keeps the display readable without
+        # hiding quiet syllables between 100 ms audio chunks.
+        weight = 0.65 if dbfs > self._level_dbfs else 0.20
+        self._level_dbfs += weight * (dbfs - self._level_dbfs)
+        self._level.set_text(f"{self._level_dbfs:.0f} dB")
+        self._wave.queue_draw()
+        return False
 
     def finish(self) -> None:
         if not self._active:
@@ -159,9 +183,16 @@ class PreeditOverlay:
 
     def _draw_wave(self, _widget, cr) -> bool:
         elapsed = max(0.0, time.monotonic() - self._started_at)
-        cr.set_source_rgb(0.72, 0.27, 0.98)
+        level = level_fraction(self._level_dbfs)
+        if self._level_dbfs > -6.0:
+            cr.set_source_rgb(1.0, 0.35, 0.35)
+        elif self._level_dbfs >= -36.0:
+            cr.set_source_rgb(0.30, 0.88, 0.55)
+        else:
+            cr.set_source_rgb(0.72, 0.27, 0.98)
         for index in range(12):
-            amplitude = 3.0 + 6.0 * abs(math.sin(elapsed * 5.0 + index * 0.8))
+            motion = 0.45 + 0.55 * abs(math.sin(elapsed * 5.0 + index * 0.8))
+            amplitude = 2.0 + 16.0 * level * motion
             x = 3.0 + index * 5.7
             cr.set_line_width(2.2)
             cr.move_to(x, 10.0 - amplitude / 2.0)

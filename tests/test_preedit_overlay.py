@@ -2,7 +2,12 @@
 
 import unittest
 
-from spitch.ui.preedit import format_elapsed, overlay_position, preview_text
+from spitch.ui.preedit import (
+    format_elapsed,
+    level_fraction,
+    overlay_position,
+    preview_text,
+)
 
 
 class FormattingTests(unittest.TestCase):
@@ -14,6 +19,11 @@ class FormattingTests(unittest.TestCase):
     def test_preview_keeps_latest_text(self):
         self.assertEqual(preview_text("  你好   世界  "), "你好 世界")
         self.assertEqual(preview_text("abcdefgh", limit=5), "…efgh")
+
+    def test_level_fraction(self):
+        self.assertEqual(level_fraction(-80), 0.0)
+        self.assertAlmostEqual(level_fraction(-33), 0.5)
+        self.assertEqual(level_fraction(0), 1.0)
 
 
 class PositionTests(unittest.TestCase):
