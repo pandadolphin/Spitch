@@ -23,7 +23,7 @@ class _Harness(AudioCapture):
     _on_audio with raw PCM bytes.
     """
 
-    def __init__(self, prebuffer_ms: int, *, on_level=None):
+    def __init__(self, prebuffer_ms: int, *, on_level=None, on_session_live=None):
         super().__init__(
             AudioConfig(
                 sample_rate=16000,
@@ -31,6 +31,7 @@ class _Harness(AudioCapture):
                 prebuffer_ms=prebuffer_ms,
             ),
             on_level=on_level,
+            on_session_live=on_session_live,
         )
 
     def _open_backend(self) -> str:  # noqa: D401 - test stub
@@ -70,6 +71,82 @@ class LevelMeterTests(unittest.TestCase):
         audio.stop()
         self.assertEqual(len(levels), 1)
         self.assertAlmostEqual(levels[0], -6.02, places=1)
+        audio.close()
+
+
+class SessionLiveTests(unittest.TestCase):
+    """``on_session_live`` gates the start cue (docs/sound-cues.md).
+
+    It must fire exactly once per session, on the first chunk the
+    backend delivers *after* start() — never on the prebuffer replay,
+    never between sessions, and again on the next session.
+    """
+
+    def test_fires_once_on_first_live_chunk_after_start(self):
+        live: list[int] = []
+        audio = _Harness(prebuffer_ms=500, on_session_live=lambda: live.append(1))
+        audio.open()
+        audio._on_audio(b"pre1")
+        audio._on_audio(b"pre2")
+        self.assertEqual(live, [])          # idle mic: nothing
+        audio.start()
+        self.assertEqual(live, [])          # prebuffer replay is not "live"
+        audio._on_audio(b"live1")
+        self.assertEqual(live, [1])
+        audio._on_audio(b"live2")
+        self.assertEqual(live, [1])         # once per session
+        audio.stop()
+        audio._on_audio(b"between")
+        self.assertEqual(live, [1])
+        audio.close()
+
+    def test_fires_again_for_the_next_session(self):
+        live: list[int] = []
+        audio = _Harness(prebuffer_ms=500, on_session_live=lambda: live.append(1))
+        audio.open()
+        audio.start()
+        audio._on_audio(b"a")
+        audio.stop()
+        list(audio.chunks())
+        audio.start()
+        self.assertEqual(live, [1])
+        audio._on_audio(b"b")
+        self.assertEqual(live, [1, 1])
+        audio.stop()
+        audio.close()
+
+    def test_silent_backend_never_fires(self):
+        """A press whose backend delivers nothing gets no cue — that
+        silence is the user-facing signal that nothing is recorded."""
+        live: list[int] = []
+        audio = _Harness(prebuffer_ms=500, on_session_live=lambda: live.append(1))
+        audio.open()
+        audio.start()
+        audio.stop()
+        self.assertEqual(live, [])
+        audio.close()
+
+    def test_callback_exception_does_not_lose_audio(self):
+        def boom():
+            raise RuntimeError("cue backend exploded")
+
+        audio = _Harness(prebuffer_ms=500, on_session_live=boom)
+        audio.open()
+        audio.start()
+        audio._on_audio(b"live1")
+        audio._on_audio(b"live2")
+        audio.stop()
+        self.assertEqual(list(audio.chunks()), [b"live1", b"live2"])
+        audio.close()
+
+    def test_legacy_open_on_press_mode_fires_too(self):
+        live: list[int] = []
+        audio = _Harness(prebuffer_ms=0, on_session_live=lambda: live.append(1))
+        audio.start()
+        self.assertEqual(live, [])
+        audio._on_audio(b"first")
+        self.assertEqual(live, [1])
+        audio.stop()
         audio.close()
 
 

@@ -89,6 +89,27 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # against doesn't apply.
         "salmon_key": "Super",
     },
+    "sounds": {
+        # Short auditory cues so dictation works eyes-off. ``start`` is
+        # a tick played only once the mic has delivered the first live
+        # chunk of the session — hear it, then talk, and nothing is
+        # lost; hear nothing and nothing is being recorded. ``stop``
+        # plays on release / cancel, ``done`` after a successful paste.
+        # See docs/sound-cues.md.
+        "enabled": True,
+        # Linear gain 0–1 applied to the built-in tones (authored at
+        # full scale) or to a custom file. 0 disables the cues.
+        "volume": 0.3,
+        "start": True,
+        "stop": True,
+        "done": True,
+        # Optional 16-bit PCM WAV per cue (mono or stereo, ≤ 10 s).
+        # Empty = built-in tone. Unreadable / unsupported files fall
+        # back to the built-in tone with a warning in daemon.log.
+        "start_file": "",
+        "stop_file": "",
+        "done_file": "",
+    },
     "inject": {
         # Synthetic keystroke used to paste the final transcript into the
         # focused app. ``Ctrl+Shift+V`` works in terminals (where Ctrl+V

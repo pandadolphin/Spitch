@@ -427,6 +427,24 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
     )
     grid.attach(cb_pause_media, 0, 5, 3, 1)
 
+    snd = dict(cfg.get("sounds") or {})
+    cb_sounds = Gtk.CheckButton(label="提示音：麦克风就绪 tick / 松手 tok / 粘贴完成 ding")
+    cb_sounds.set_active(bool(snd.get("enabled", True)))
+    cb_sounds.set_tooltip_text(
+        "开始音只在麦克风真正开始向本次会话送音频后才响：听到再说，不会丢开头；"
+        "按下没声音 = 这次没在录（上一次还在收尾）。"
+        "单个开关 / 自定义 WAV 见 config.json 的 sounds 段。"
+    )
+    grid.attach(cb_sounds, 0, 6, 3, 1)
+
+    e_volume = Gtk.SpinButton.new_with_range(0.0, 1.0, 0.05)
+    e_volume.set_digits(2)
+    try:
+        e_volume.set_value(float(snd.get("volume", 0.3)))
+    except (TypeError, ValueError):
+        e_volume.set_value(0.3)
+    add_row(7, "提示音音量 (0–1)", e_volume)
+
     # --- Auto-start checkbox ----------------------------------------
     # Talks to the user-level systemd unit. Hidden when systemctl
     # --user isn't a thing on this host (non-systemd distros).
@@ -443,7 +461,7 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
         cb_autostart.set_tooltip_text(
             "这台机器没有可用的 systemd --user 实例，无法自动启动"
         )
-    grid.attach(cb_autostart, 0, 6, 3, 1)
+    grid.attach(cb_autostart, 0, 8, 3, 1)
 
     info = Gtk.Label(
         label=(
@@ -489,6 +507,9 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
         new_cfg["audio"] = dict(new_cfg.get("audio") or {})
         new_cfg["audio"]["prebuffer_ms"] = int(e_prebuf.get_value())
         new_cfg["audio"]["pause_media_on_talk"] = bool(cb_pause_media.get_active())
+        new_cfg["sounds"] = dict(new_cfg.get("sounds") or {})
+        new_cfg["sounds"]["enabled"] = bool(cb_sounds.get_active())
+        new_cfg["sounds"]["volume"] = round(float(e_volume.get_value()), 2)
         try:
             path = save_config(new_cfg)
             resp = request_reload()

@@ -48,6 +48,7 @@ from .hotkey import (
 )
 from .inject import inject_text
 from .media_pause import MediaPauser
+from .sounds import SoundCues
 from .tray import try_create as try_create_indicator
 from .voice import (
     AudioCapture,
@@ -263,6 +264,13 @@ class SpitchDaemon:
         except (TypeError, ValueError):
             pause_media = True
         self._media = MediaPauser(enabled=pause_media)
+        # Auditory cues (docs/sound-cues.md). ``start`` is driven by the
+        # capture layer's on_session_live, not by the hotkey — see
+        # _on_capture_live. ``stop`` / ``done`` are driven from here.
+        self._sounds = SoundCues.from_config(cfg)
+        # monotonic() at the moment we asked the controller to start a
+        # session; _on_capture_live logs the press→mic-live latency.
+        self._press_mono: float = 0.0
         self._reload_lock = threading.Lock()
         self._pending_reload = False
         self._reloading = False
@@ -286,6 +294,7 @@ class SpitchDaemon:
         audio = AudioCapture(
             AudioConfig(sample_rate=sample_rate, prebuffer_ms=prebuffer_ms),
             on_level=self._on_audio_level,
+            on_session_live=self._on_capture_live,
         )
         controller_t, inject_t = _finalize_deadlines(cfg)
         log.info(
@@ -409,6 +418,7 @@ class SpitchDaemon:
         self._pending_reload = False
         old_audio = self._audio
         old_voice = self._voice
+        old_sounds = self._sounds
         self._stop_hotkeys()
         try:
             audio, voice, inject_t = self._construct_voice(new_cfg)
@@ -416,6 +426,8 @@ class SpitchDaemon:
             self._audio = audio
             self._voice = voice
             self._finalize_timeout = inject_t
+            self._sounds = SoundCues.from_config(new_cfg)
+            log.info(self._sounds.describe())
             try:
                 self._media.enabled = bool(
                     _section(new_cfg, "audio").get("pause_media_on_talk", True)
@@ -453,6 +465,11 @@ class SpitchDaemon:
                 old_audio.close()
             except Exception:
                 log.exception("reload: old audio close failed")
+        if old_sounds is not self._sounds:
+            try:
+                old_sounds.close()
+            except Exception:
+                log.exception("reload: old sound cues close failed")
         self._warmup_kick.set()
         log.info("config reloaded: provider %s → %s", old_provider, new_provider)
         if old_provider != new_provider:
@@ -479,6 +496,26 @@ class SpitchDaemon:
     def _on_audio_level(self, dbfs: float) -> None:
         if self._active_source == "paste" and self._indicator is not None:
             self._indicator.set_level(dbfs)
+
+    def _on_capture_live(self) -> None:
+        """First live PCM chunk of this session reached the session queue.
+
+        Runs on the audio backend thread. This — not the hotkey press —
+        is the only place the ``start`` cue is played: from here on,
+        everything the user says is in the stream (plus the prebuffer
+        before it). A press whose mic never delivers stays silent, and
+        that silence is the signal (docs/sound-cues.md).
+
+        Does not consult ``_active_source``: this can run before
+        _on_press has tagged the session, and both paste and salmon
+        sessions want the cue anyway.
+        """
+        if self._press_mono:
+            log.info(
+                "mic live: first chunk %.0f ms after press",
+                (time.monotonic() - self._press_mono) * 1000.0,
+            )
+        self._sounds.play("start")
 
     def _on_partial(self, text: str) -> None:
         if text:
@@ -643,7 +680,10 @@ class SpitchDaemon:
         # the still-pending on_final would write to a queue nobody
         # is reading from.
         new_pending: "queue.Queue[str]" = queue.Queue(maxsize=1)
+        self._press_mono = time.monotonic()
         if not self._voice.press():
+            # No start cue will follow — the mic was never (re)started
+            # for this press. The user hears silence and knows to wait.
             log.info("press: voice not idle (state=%s)", self._voice.state)
             return
         # Tag this session so _on_partial / _on_final route to the
@@ -691,6 +731,12 @@ class SpitchDaemon:
             log.info("release: ignored (no accepted press)")
             return
         self._press_accepted = False
+        # Stop cue at key-up, before media resume: playerctl round
+        # trips below can take tens of ms each and the cue should track
+        # the user's action, not the MPRIS bus. The release linger
+        # keeps capturing for another ~300 ms; a 70 ms soft tone in the
+        # tail is harmless to the recognizer.
+        self._sounds.play("stop")
         # Resume media as soon as the user stops talking — do not wait
         # for FINALIZING / inject, which can take seconds on a slow
         # network and would leave songs muted too long.
@@ -747,6 +793,9 @@ class SpitchDaemon:
     def _on_cancel(self) -> None:
         if self._voice is None:
             return
+        if self._press_accepted:
+            # Mic is closing for this session; no ``done`` will follow.
+            self._sounds.play("stop")
         self._voice.cancel()
         # Drop the queue and the accepted-press flag so the eventual
         # _on_release (the user is still holding the modifiers when
@@ -804,6 +853,7 @@ class SpitchDaemon:
             return
         if self._linger_timer is not None:
             self._cancel_pending_linger()
+        self._press_mono = time.monotonic()
         if not self._voice.press():
             log.info("salmon press: voice not idle (state=%s)", self._voice.state)
             return
@@ -854,6 +904,7 @@ class SpitchDaemon:
         if not self._press_accepted or self._active_source != "salmon":
             return
         self._press_accepted = False
+        self._sounds.play("stop")
         self._cancel_salmon_watchdog()
         try:
             self._media.resume()
@@ -887,6 +938,8 @@ class SpitchDaemon:
         if self._active_source != "salmon":
             return
         log.info("salmon cancelled (third key during chord)")
+        if self._press_accepted:
+            self._sounds.play("stop")
         self._voice.cancel()
         self._press_accepted = False
         self._cancel_salmon_watchdog()
@@ -931,6 +984,7 @@ class SpitchDaemon:
         except Exception:
             log.exception("watchdog release failed")
         self._press_accepted = False
+        self._sounds.play("stop")
         try:
             self._media.resume()
         except Exception:
@@ -969,7 +1023,13 @@ class SpitchDaemon:
                 )
         ok, reason = self._inject_text_locked(text)
         log.info("inject: result ok=%s reason=%r", ok, reason)
-        if not ok:
+        if ok:
+            # Only on a paste that landed. No ``done`` after ``stop``
+            # means the text did not reach the app (empty transcript,
+            # timeout, inject failure) — the user can re-dictate or
+            # repaste without looking.
+            self._sounds.play("done")
+        else:
             _notify("Spitch — inject failed", reason or "unknown error")
         # Record this session in history regardless of inject success —
         # the user may want to repaste a session whose first inject was
@@ -1149,6 +1209,7 @@ class SpitchDaemon:
         talk_label = format_talk_keys(
             parse_talk_keys(str(talk_spec) if talk_spec else "")
         )
+        log.info(self._sounds.describe())
         log.info("Spitch daemon ready — hold %s to talk", talk_label)
         _notify("Spitch ready", "Hold " + talk_label + " to talk")
 
@@ -1377,6 +1438,10 @@ class SpitchDaemon:
             except Exception:
                 log.exception("shutdown: audio.close failed")
             self._audio = None
+        try:
+            self._sounds.close()
+        except Exception:
+            log.exception("shutdown: sound cues close failed")
         log.info("shutdown: complete")
 
 

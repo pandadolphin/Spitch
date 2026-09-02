@@ -119,10 +119,19 @@ class AudioCapture:
         device: str | None = None,
         *,
         on_level: Callable[[float], None] | None = None,
+        on_session_live: Callable[[], None] | None = None,
     ):
         self.config = config or AudioConfig()
         self.device = device
         self._on_level = on_level
+        # Fired once per session, from the backend thread, when the
+        # first *live* chunk after start() lands in the session queue.
+        # The prebuffer replay does not count — it is audio from before
+        # the press. This is the "audio_capture_state == READY" moment
+        # the start cue is gated on (docs/sound-cues.md): a session
+        # whose backend never delivers a chunk never fires it.
+        self._on_session_live = on_session_live
+        self._session_live = False
         # Bounded ring buffer for continuous pre-recording. With
         # ``maxlen=0`` (prebuffer disabled) deque.append is a no-op,
         # which is exactly what we want for the legacy behavior — no
@@ -176,15 +185,25 @@ class AudioCapture:
         if not chunk:
             return
         session_active = False
+        went_live = False
         with self._lock:
             self._prebuffer.append(chunk)
             self._last_chunk_at = time.monotonic()
             if self._session_active:
                 session_active = True
+                if not self._session_live:
+                    self._session_live = True
+                    went_live = True
                 try:
                     self._session_queue.put_nowait(chunk)
                 except queue.Full:
                     pass
+        if went_live and self._on_session_live is not None:
+            try:
+                self._on_session_live()
+            except Exception:
+                # Feedback only (sound cue); never let it hurt capture.
+                pass
         if session_active and self._on_level is not None:
             try:
                 self._on_level(pcm16_dbfs(chunk))
@@ -462,6 +481,7 @@ class AudioCapture:
                     self._session_queue.put_nowait(chunk)
                 except queue.Full:
                     pass
+            self._session_live = False
             self._session_active = True
         return self._backend or ""
 
@@ -476,6 +496,7 @@ class AudioCapture:
         """
         with self._lock:
             self._session_active = False
+            self._session_live = False
             try:
                 self._session_queue.put_nowait(None)
             except queue.Full:
