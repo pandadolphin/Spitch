@@ -4,6 +4,29 @@
 
 ## Unreleased
 
+### Sound cues: a tick when the mic is actually live
+
+- Three short auditory cues, on by default: `start` (1320 Hz tick,
+  90 ms), `stop` (880 Hz, 70 ms) at key-up / cancel, `done` (two rising
+  notes) after a paste that landed. Dictation works eyes-off: hear the
+  tick, talk.
+- **Invariant:** `start` is driven by `AudioCapture.on_session_live` —
+  the first live PCM chunk of the session reaching the session queue —
+  never by the hotkey callback. A press rejected during FINALIZING, a
+  reload, or a dead mic stays silent, and that silence is the signal.
+  Measured press → live: 10–34 ms in live sessions, ≤ 106 ms worst
+  case (arecord, bounded by the 100 ms chunk).
+- `daemon.log` gains `mic live: first chunk N ms after press` per
+  session for attributing "first words lost" reports.
+- New `sounds` config section: `enabled`, `volume` (0–1, default 0.3),
+  per-cue `start` / `stop` / `done`, and `*_file` for custom 16-bit
+  WAVs. Console Settings tab exposes enable + volume; hot-reload
+  rebuilds the player.
+- Playback is fire-and-forget on one worker thread; backends
+  `sounddevice` → `paplay --latency-msec=30` → `pw-play` → `aplay`,
+  each dropped after one failure, none required. Design and numbers:
+  `docs/sound-cues.md`.
+
 ### Configurable talk key defaults to Right Ctrl
 
 - `hotkey.talk_key` is configurable in `spitch-config`, the console,

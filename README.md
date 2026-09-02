@@ -20,6 +20,7 @@
 
 - **全局热键**：默认长按 `RightCtrl`，也可配置为 `RightAlt`、双修饰键组合或多个备选热键
 - **说话时自动暂停媒体**（v0.7.1）：通过 `playerctl` 暂停 MPRIS 播放器，松手后恢复（可关）
+- **提示音**：麦克风真正开始送音频后响一声 tick（不是"收到热键"就响），松手 tok，粘贴成功 ding。按下没声音 = 这次没在录。不用盯屏幕也知道什么时候能说；可关、可调音量、可换自己的 WAV。设计见 [`docs/sound-cues.md`](docs/sound-cues.md)
 - **真·实时 ASR**：默认豆包 BigModel 实时端点，自带标点 + 数字归一（ITN），中文一次性输出；可选 Grok Streaming STT（见下方语言门禁）
 - **多后端**：`provider: "doubao" | "grok"`，凭据分区独立；切换后需重新 probe 验证
 - **绕过 IM 框架**：转写结果走"剪贴板 + 合成 `Ctrl+Shift+V`"，在 GTK / Qt / Electron / 原生 Wayland 应用里都能粘——飞书、微信、VS Code、Chrome 地址栏、Slack 全都覆盖
@@ -32,7 +33,7 @@
 ## 工作原理
 
 1. 用户态长进程 daemon 监听 `/dev/input/event*`，等配置好的修饰键组合
-2. 按下时打开麦克风，PCM 流通过 WebSocket 推给当前 `provider` 对应的 ASR（默认豆包）
+2. 按下时开始一次录音 session（麦克风常驻，先回放 500 ms 预缓冲），第一块 live 音频进入队列时响 tick；PCM 流通过 WebSocket 推给当前 `provider` 对应的 ASR（默认豆包）
 3. 松开后（含可配置的 `audio.release_linger_ms` linger）进入 FINALIZING：以 `inject.final_wait_seconds` 为 **stream budget**（默认 **30 秒**）等待 server 的最终结果；inject 侧会比 controller 再多等 linger + 少量 slack，避免 final 晚到被丢
 4. 把结果写进剪贴板，等用户物理松开热键后，通过 `/dev/uinput` 合成 `Ctrl+Shift+V` 触发粘贴
 5. 约 0.3 秒后还原原剪贴板，避免污染你下一次手动粘贴
@@ -103,6 +104,10 @@ spitch-daemon &      # 按住 Right Ctrl 说话，松开后自动粘贴
 | `audio.sample_rate` | 麦克风采样率 | 16000 |
 | `audio.prebuffer_ms` | 常驻麦克风的环形预缓冲长度（ms）。修复"按下后说的前半截被吃掉"——按下时回放这段缓冲。设为 0 = 关闭常驻麦克风，按下才开 | `500` |
 | `audio.pause_media_on_talk` | 按住说话键时用 `playerctl` 暂停正在播放的 MPRIS 媒体，松手后恢复。需安装 `playerctl` | `true` |
+| `sounds.enabled` | 提示音总开关。`start` tick 只在麦克风向本次 session 送出第一块 live 音频后才响；`stop` 松手时；`done` 粘贴成功后 | `true` |
+| `sounds.volume` | 提示音音量，0–1 线性增益；0 = 关 | `0.3` |
+| `sounds.start` / `sounds.stop` / `sounds.done` | 单项开关 | `true` |
+| `sounds.start_file` / `sounds.stop_file` / `sounds.done_file` | 自定义 16-bit PCM WAV（单/双声道，≤ 10 s）；留空用内置音，读不了回退内置音并在日志里警告 | `""` |
 | `hotkey.talk_key` | 按住说话的修饰键。`RightAlt` / `RightCtrl` 可单用；双修饰键用 `+`，多个备选用逗号 | `RightCtrl` |
 | `inject.paste_keystroke` | 粘贴用的合成快捷键 | `Ctrl+Shift+V` |
 | `inject.restore_clipboard_delay_ms` | 粘贴后等多久才把剪贴板还原（ms） | `800` |
