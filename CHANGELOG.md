@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+### Configurable talk key defaults to Right Ctrl
+
+- `hotkey.talk_key` is configurable in `spitch-config`, the console,
+  or `config.json`, and now defaults to `RightCtrl`. Existing explicit
+  settings are preserved.
+
 ### Provider switch without restarting the daemon
 
 - `reload_config` is implemented. Saving in `spitch-config` / the
@@ -37,7 +43,7 @@
 
 ### Right Alt as hold-to-talk
 
-- `hotkey.talk_key` still defaults to a two-modifier chord (`Ctrl+Alt`).
+- `hotkey.talk_key` accepts a two-modifier chord or a sided single key.
   Generic single `Alt`/`Ctrl`/`Shift`/`Super` stay rejected (they fire
   on everyday shortcuts). `RightAlt` / `RightCtrl` are allowed as a
   single hold: US layout Right Alt is `Alt_R`, not AltGr, and is far

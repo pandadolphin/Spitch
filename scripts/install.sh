@@ -170,7 +170,7 @@ spitch installed. Next steps:
        spitch-daemon &
 
      A "Spitch ready" notification appears. Hold the configured talk
-     key (default Ctrl+Alt — both held simultaneously) to record;
+     key (default Right Ctrl) to record;
      release to commit the punctuated final transcript into the
      focused app via clipboard + synthetic Ctrl+V.
 

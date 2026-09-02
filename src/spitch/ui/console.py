@@ -363,7 +363,12 @@ def _build_log_tab(Gtk, GLib, Pango):  # pragma: no cover
 
 def _build_settings_tab(Gtk, GLib):  # pragma: no cover
     from ..config import (
-        config_path, default_config, is_complete, load_config, save_config,
+        DEFAULT_TALK_KEY,
+        config_path,
+        default_config,
+        is_complete,
+        load_config,
+        save_config,
     )
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     box.set_border_width(8)
@@ -381,7 +386,7 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
         grid.attach(widget, 1, row, 2, 1)
 
     e_talk = Gtk.Entry()
-    e_talk.set_text(h.get("talk_key", "Ctrl+Alt"))
+    e_talk.set_text(h.get("talk_key", DEFAULT_TALK_KEY))
     e_talk.set_hexpand(True)
     e_talk.set_placeholder_text("Ctrl+Alt or RightAlt, RightCtrl")
     add_row(0, "热键 (talk_key)", e_talk)
@@ -474,7 +479,9 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
         # clobbered by the snapshot taken when this tab opened.
         new_cfg.update(load_config())
         new_cfg["hotkey"] = dict(new_cfg.get("hotkey") or {})
-        new_cfg["hotkey"]["talk_key"] = e_talk.get_text().strip() or "Ctrl+Alt"
+        new_cfg["hotkey"]["talk_key"] = (
+            e_talk.get_text().strip() or DEFAULT_TALK_KEY
+        )
         new_cfg["inject"] = dict(new_cfg.get("inject") or {})
         new_cfg["inject"]["paste_keystroke"] = e_paste.get_text().strip() or "Ctrl+Shift+V"
         new_cfg["inject"]["restore_clipboard_delay_ms"] = int(e_restore.get_value())

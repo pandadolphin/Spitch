@@ -12,6 +12,7 @@ from pathlib import Path
 
 from spitch.config import (
     DEFAULT_CONFIG,
+    DEFAULT_TALK_KEY,
     FINALIZE_MIN_S,
     FINALIZE_SLACK_S,
     LINGER_MAX_S,
@@ -82,8 +83,19 @@ class LoadConfigTests(unittest.TestCase):
             self.assertEqual(cfg["doubao"]["access_key"], "")
             self.assertEqual(cfg["doubao"]["endpoint"], DEFAULT_CONFIG["doubao"]["endpoint"])
             self.assertEqual(cfg["audio"]["sample_rate"], 16000)
-            self.assertEqual(cfg["hotkey"]["talk_key"], "Ctrl+Alt")
+            self.assertEqual(cfg["hotkey"]["talk_key"], DEFAULT_TALK_KEY)
+            self.assertEqual(DEFAULT_TALK_KEY, "RightCtrl")
             self.assertEqual(cfg["provider"], "doubao")
+
+    def test_explicit_talk_key_overrides_new_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "config.json"
+            p.write_text(
+                json.dumps({"hotkey": {"talk_key": "RightAlt"}}),
+                encoding="utf-8",
+            )
+            cfg = load_config(p)
+            self.assertEqual(cfg["hotkey"]["talk_key"], "RightAlt")
 
     def test_invalid_json_raises_config_error(self):
         with tempfile.TemporaryDirectory() as td:

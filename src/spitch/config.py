@@ -22,6 +22,9 @@ class ConfigError(Exception):
     """Raised when the on-disk config is malformed."""
 
 
+DEFAULT_TALK_KEY = "RightCtrl"
+
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "provider": "doubao",
     "doubao": {
@@ -75,7 +78,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pause_media_on_talk": True,
     },
     "hotkey": {
-        "talk_key": "Ctrl+Alt",
+        "talk_key": DEFAULT_TALK_KEY,
         # v0.6: optional second hotkey that routes the transcript to
         # the salmon event bus instead of the focused-app paste path.
         # An external subscriber (the Salmon Overlay window) consumes

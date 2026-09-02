@@ -1,7 +1,7 @@
 """Spitch daemon — global hotkey + voice ASR + clipboard text injection.
 
-Runs as a long-lived user process. Listens for the configured talk-key
-combo (default ``Ctrl+Alt``) via /dev/input/event*, captures audio while
+Runs as a long-lived user process. Listens for the configured talk key
+(default ``RightCtrl``) via /dev/input/event*, captures audio while
 held, streams it to the configured ASR provider (Doubao or Grok STT) for
 realtime transcription, and on release injects the final punctuated text
 into the focused application via the clipboard + a synthetic paste
@@ -28,6 +28,7 @@ from typing import Any, Callable, Mapping, Optional
 
 from .cmdsock import CmdServer, default_socket_path
 from .config import (
+    DEFAULT_TALK_KEY,
     _finalize_deadlines,
     _finite_float,
     _release_linger_seconds,
@@ -157,7 +158,7 @@ def validate_runtime_config(cfg: Mapping[str, Any]) -> str | None:
             "not verified — run spitch-config and click "
             "'Test connection' before switching provider"
         )
-    talk_spec = _section(cfg, "hotkey").get("talk_key", "Ctrl+Alt")
+    talk_spec = _section(cfg, "hotkey").get("talk_key", DEFAULT_TALK_KEY)
     combos = parse_talk_keys(str(talk_spec) if talk_spec else "")
     if not combos:
         return (
@@ -232,7 +233,7 @@ class SpitchDaemon:
         self._linger_timer: Optional[threading.Timer] = None
         # v0.6: salmon-mode hotkey. Set when an active press came from
         # the salmon hotkey (Super by default) instead of the paste
-        # hotkey (Ctrl+Alt). Drives the routing in _on_partial /
+        # configured paste-path hotkey. Drives the routing in _on_partial /
         # _on_final: paste sessions feed inject_text, salmon sessions
         # publish events on _bus and DON'T touch the clipboard at all.
         self._salmon_listener: Optional[HotkeyListener] = None
@@ -325,7 +326,7 @@ class SpitchDaemon:
                 log.exception("stop hotkey listener failed")
 
     def _start_hotkeys(self, cfg: Mapping[str, Any]) -> None:
-        talk_spec = _section(cfg, "hotkey").get("talk_key", "Ctrl+Alt")
+        talk_spec = _section(cfg, "hotkey").get("talk_key", DEFAULT_TALK_KEY)
         combos = parse_talk_keys(str(talk_spec) if talk_spec else "")
         allow_single = any(len(c) == 1 for c in combos)
         self._listener = HotkeyListener(
@@ -455,7 +456,9 @@ class SpitchDaemon:
         log.info("config reloaded: provider %s → %s", old_provider, new_provider)
         if old_provider != new_provider:
             _notify("Spitch", f"provider: {new_provider}")
-        talk_spec = _section(new_cfg, "hotkey").get("talk_key", "Ctrl+Alt")
+        talk_spec = _section(new_cfg, "hotkey").get(
+            "talk_key", DEFAULT_TALK_KEY
+        )
         return {
             "ok": True,
             "applied": True,
@@ -1135,7 +1138,9 @@ class SpitchDaemon:
             log.warning("could not start cmd socket (%s) — console / "
                         "spitch-cli won't be able to talk to daemon", exc)
             self._cmdserver = None
-        talk_spec = _section(self._cfg, "hotkey").get("talk_key", "Ctrl+Alt")
+        talk_spec = _section(self._cfg, "hotkey").get(
+            "talk_key", DEFAULT_TALK_KEY
+        )
         talk_label = format_talk_keys(
             parse_talk_keys(str(talk_spec) if talk_spec else "")
         )

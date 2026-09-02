@@ -77,7 +77,7 @@ Choose **Provider**: `doubao` (default) or `grok`.
 | Resource ID      | Default `volc.bigasr.sauc.duration` (BigModel realtime)       |
 | WS endpoint      | Default `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel` |
 | Audio sample rate| 16000 (recommended)                                           |
-| Push-to-talk key | Hold this combo to record. Default `Ctrl+Alt`.                |
+| Push-to-talk key | Hold this key or combo to record. Default `RightCtrl`.        |
 
 The console's "Secret Key" is **not** used by this realtime endpoint —
 leave it where it is.
@@ -192,8 +192,8 @@ You should see a "Spitch ready" desktop notification. Test it:
 
 * Focus any text input (browser address bar, gedit, terminal, Feishu,
   VS Code, Slack, …).
-* Hold the configured talk key (default Ctrl+Alt — both modifiers,
-  no third key). A "🎙 Spitch listening…" notification appears.
+* Hold the configured talk key (default Right Ctrl). A
+  "🎙 Spitch listening…" notification appears.
 * Speak. Release. A "✍ Spitch finalizing…" notification appears
   briefly, then the punctuated final transcript is pasted into the
   focused field.
@@ -240,7 +240,7 @@ journalctl --user -u spitch.service -f    # tail logs
   distros you may need a udev rule.
 * **Hotkey does nothing** → tail
   `${XDG_STATE_HOME:-$HOME/.local/state}/spitch/daemon.log`. If you
-  see no key events at all when pressing Ctrl+Alt, the daemon is not
+  see no key events at all when pressing the configured key, the daemon is not
   reading the right device — confirm with
   `cat /proc/bus/input/devices` that your keyboard is enumerated.
 * **Clipboard contents are surprising afterwards** → Spitch saves

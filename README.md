@@ -6,19 +6,19 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 [![Wayland | X11](https://img.shields.io/badge/display-Wayland%20%7C%20X11-green.svg)](#系统要求)
 
-按住 **Ctrl + Alt** 说话，松开自动把带标点的中文（或任意 Unicode）粘进当前应用。**不依赖 IBus / fcitx5 等输入法框架**，与你已有的拼音 / 五笔输入法和平共存。Wayland、X11 都可用。
+按住 **Right Ctrl** 说话，松开自动把带标点的中文（或任意 Unicode）粘进当前应用。**不依赖 IBus / fcitx5 等输入法框架**，与你已有的拼音 / 五笔输入法和平共存。Wayland、X11 都可用。
 
 **豆包（`provider: "doubao"`）是默认、也是推荐的中文路径。** 可选接入 xAI **Grok Streaming STT**（`provider: "grok"`）；**Grok 对中文（Mandarin）的支持尚未做 live 验证**，在语言门禁通过前文档与 UI **不会**宣称 Grok 支持中文。需要稳定中文语音输入时请继续用豆包。
 
 ```
-按住 Ctrl+Alt ──▶ 🎙 录音 ──▶ ✍ 转写 ──▶ 自动粘到光标位置
+按住 Right Ctrl ──▶ 🎙 录音 ──▶ ✍ 转写 ──▶ 自动粘到光标位置
 ```
 
 ---
 
 ## 特性
 
-- **全局热键**：默认 `Ctrl+Alt` 双键长按；按下第三键（如 `Ctrl+Alt+T`）自动取消，让系统快捷键正常生效
+- **全局热键**：默认长按 `RightCtrl`，也可配置为 `RightAlt`、双修饰键组合或多个备选热键
 - **说话时自动暂停媒体**（v0.7.1）：通过 `playerctl` 暂停 MPRIS 播放器，松手后恢复（可关）
 - **真·实时 ASR**：默认豆包 BigModel 实时端点，自带标点 + 数字归一（ITN），中文一次性输出；可选 Grok Streaming STT（见下方语言门禁）
 - **多后端**：`provider: "doubao" | "grok"`，凭据分区独立；切换后需重新 probe 验证
@@ -63,7 +63,7 @@ sudo apt-get install -y python3-evdev wl-clipboard playerctl
 ./scripts/install.sh
 spitch-config        # 选择 doubao（默认）或 grok，填凭据，点 "Test connection" 验证
 sudo usermod -aG input $USER     # 一次性，然后重登
-spitch-daemon &      # 按住 Ctrl+Alt 说话，松开后自动粘贴
+spitch-daemon &      # 按住 Right Ctrl 说话，松开后自动粘贴
 ```
 
 `spitch-config` 会让你选 **Provider**（`doubao` / `grok`），并 **必须** 通过 “Test connection” / probe 才会写入 `verified_*` 戳记；未验证的配置 daemon 不会当完整凭据用。
@@ -103,7 +103,7 @@ spitch-daemon &      # 按住 Ctrl+Alt 说话，松开后自动粘贴
 | `audio.sample_rate` | 麦克风采样率 | 16000 |
 | `audio.prebuffer_ms` | 常驻麦克风的环形预缓冲长度（ms）。修复"按下后说的前半截被吃掉"——按下时回放这段缓冲。设为 0 = 关闭常驻麦克风，按下才开 | `500` |
 | `audio.pause_media_on_talk` | 按住说话键时用 `playerctl` 暂停正在播放的 MPRIS 媒体，松手后恢复。需安装 `playerctl` | `true` |
-| `hotkey.talk_key` | 按住说话的修饰键。默认双键组合；`RightAlt` / `RightCtrl` 可单用，逗号表示「或」 | `Ctrl+Alt` |
+| `hotkey.talk_key` | 按住说话的修饰键。`RightAlt` / `RightCtrl` 可单用；双修饰键用 `+`，多个备选用逗号 | `RightCtrl` |
 | `inject.paste_keystroke` | 粘贴用的合成快捷键 | `Ctrl+Shift+V` |
 | `inject.restore_clipboard_delay_ms` | 粘贴后等多久才把剪贴板还原（ms） | `800` |
 | `inject.final_wait_seconds` | 松手进入 FINALIZING 后，等 server final 的 **stream budget**（秒）。controller 用 `max(该值, 5)`；inject 队列等待会略长（+ linger + slack） | `30.0` |
@@ -146,10 +146,10 @@ v0.5 起 daemon 维护最近 50 条转写历史，提供三种使用方式：
 Spitch 会在粘贴前保存原剪贴板，约 0.3 秒后还原。如果你的目标应用消费粘贴较慢，原剪贴板可能在被消费前覆盖回去；增大 `src/spitch/inject/text_injector.py` 里的 sleep。
 
 **怎么换热键？**
-`spitch-config` 的 *Push-to-talk key* 字段，或直接编辑 `config.json` 的 `hotkey.talk_key`。支持修饰键双键组合（`Ctrl/Alt/Shift/Super` 任选两个），以及单侧单键 `RightAlt` / `RightCtrl`。多个热键用逗号或 `or`：`RightAlt, RightCtrl` 表示按住其中任意一个即可。左 Alt / 左 Ctrl 仍走系统快捷键。不支持字母键。改完重启 daemon。
+`spitch-config` 的 *Push-to-talk key* 字段，或直接编辑 `config.json` 的 `hotkey.talk_key`。支持修饰键双键组合（`Ctrl/Alt/Shift/Super` 任选两个），以及单侧单键 `RightAlt` / `RightCtrl`。多个热键用逗号或 `or`：`RightAlt, RightCtrl` 表示按住其中任意一个即可。左 Alt / 左 Ctrl 仍走系统快捷键。不支持字母键。保存后运行中的 daemon 会自动热加载。
 
 **第三键取消是什么意思？**
-按住 `Ctrl+Alt` 期间如果再按字母（比如要 `Ctrl+Alt+T` 开终端），录音自动作废、热键正常作为系统快捷键生效。让你不用为了用 Spitch 而避开常见系统快捷键。
+配置双修饰键组合时，如果按住组合后再按字母（例如 `Ctrl+Alt+T`），录音自动作废、系统快捷键正常生效。
 
 **飞书 / 微信里粘出来是空的？**
 极少数 Electron 应用对剪贴板 MIME 类型敏感。先确认 `wl-paste` 在那个应用聚焦时能拿到 Spitch 写的文本；不行的话开 Issue 贴上桌面环境信息。
@@ -186,7 +186,7 @@ MIT — 见 [LICENSE](LICENSE)。
 
 ## English
 
-**Spitch** is a global-hotkey **Chinese voice input** tool for Linux desktops. **Doubao (Volcano Engine) realtime ASR is the default and recommended Chinese path.** Hold **Ctrl+Alt** to talk, release to commit punctuated text into the focused app via clipboard + synthetic `Ctrl+Shift+V` — bypassing the input-method framework entirely. Works on Wayland and X11 alike, in any GTK / Qt / Electron / native-Wayland app, and coexists with whatever IBus / fcitx5 setup you already have.
+**Spitch** is a global-hotkey **Chinese voice input** tool for Linux desktops. **Doubao (Volcano Engine) realtime ASR is the default and recommended Chinese path.** Hold **Right Ctrl** to talk, release to commit punctuated text into the focused app via clipboard + synthetic `Ctrl+Shift+V` — bypassing the input-method framework entirely. The talk key is configurable. Works on Wayland and X11 alike, in any GTK / Qt / Electron / native-Wayland app, and coexists with whatever IBus / fcitx5 setup you already have.
 
 **Optional:** `provider: "grok"` enables xAI Grok Streaming STT. **Mandarin support for Grok is unvalidated** — do not treat Grok as a Chinese backend until a live checklist passes and release notes say so. Language gate remains closed until then.
 

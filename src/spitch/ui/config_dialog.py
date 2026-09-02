@@ -29,6 +29,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from ..config import (
+    DEFAULT_TALK_KEY,
     clear_verified,
     config_path,
     credentials_signature,
@@ -297,7 +298,7 @@ def run_gtk() -> int:  # pragma: no cover - GUI is exercised manually
         shared_box, "Audio sample rate", str(a.get("sample_rate", 16000))
     )
     e_talk = make_labeled_entry(
-        shared_box, "Push-to-talk key", h.get("talk_key", "Ctrl+Alt")
+        shared_box, "Push-to-talk key", h.get("talk_key", DEFAULT_TALK_KEY)
     )
     outer.pack_start(shared_box, False, False, 0)
 
@@ -378,7 +379,9 @@ def run_gtk() -> int:  # pragma: no cover - GUI is exercised manually
         new_cfg["hotkey"] = _section_dict(
             new_cfg.get("hotkey"), default_config()["hotkey"]
         )
-        new_cfg["hotkey"]["talk_key"] = e_talk.get_text().strip() or "Ctrl+Alt"
+        new_cfg["hotkey"]["talk_key"] = (
+            e_talk.get_text().strip() or DEFAULT_TALK_KEY
+        )
         return new_cfg
 
     def set_status(msg: str, ok: bool | None = None) -> None:
